@@ -147,6 +147,14 @@ vp::IoReqStatus InsituCacheAmo::req_handler(vp::Block *__this, vp::IoReq *req)
     if (op == vp::LR) {
         _this->res_.on_lr(core, addr);
         req->set_opcode(vp::READ);
+        // CRITICAL, same convention as the AMO write-back below (lsu.cpp:547-549, mirrored by
+        // memory.cpp's handle_atomic, which passes get_second_data() as its out_data for LR too):
+        // for an atomic, get_data() aliases rs2 and get_second_data() aliases rd. A plain READ
+        // writes into get_data() -- so forwarding LR untouched put the loaded value in rs2 and left
+        // rd stale.
+        if (req->get_second_data() != nullptr) {
+            req->set_data(req->get_second_data());
+        }
         return _this->output_.req_forward(req);
     }
 
