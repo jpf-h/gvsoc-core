@@ -463,6 +463,10 @@ class InsituCacheTileConfig:
     # AND the remote xbars — a region defines what an address means, so every router must agree.
     # Empty = flat routing everywhere.
     regions: str = ''
+    # No-allocate window "base:size" over GLOBAL addresses (rlc_am doc/RLC_HW.md §2), applied by
+    # every bank: reads inside it never allocate a way (single-line stream buffer instead),
+    # writes go write-through only. Empty = disabled.
+    noalloc: str = ''
     controller: InsituCacheControllerConfig = field(
         default_factory=InsituCacheControllerConfig)
     coalescer: InsituCacheCoalescerConfig = field(

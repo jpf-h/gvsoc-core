@@ -44,11 +44,13 @@ public:
     void reset(bool active) override;
     void stop() override {
         // End-of-sim counter dump (diagnostics; one line per cell).
-        fprintf(stderr, "[INSITU-CORE %s] rd_hit=%lu rd_miss=%lu wr_hit=%lu wr_miss=%lu refill=%lu evict=%lu flush=%lu/%lu | lat_sum=%lu b1=%lu clamp=%lu/%lu winfo=%lu wcommit=%lu\n",
+        fprintf(stderr, "[INSITU-CORE %s] rd_hit=%lu rd_miss=%lu wr_hit=%lu wr_miss=%lu refill=%lu evict=%lu flush=%lu/%lu sb=%lu/%lu wtna=%lu | lat_sum=%lu b1=%lu clamp=%lu/%lu winfo=%lu wcommit=%lu\n",
                 this->get_path().c_str(), (unsigned long)cnt_rd_hit_, (unsigned long)cnt_rd_miss_,
                 (unsigned long)cnt_wr_hit_, (unsigned long)cnt_wr_miss_,
                 (unsigned long)cnt_refill_, (unsigned long)cnt_evict_,
                 (unsigned long)cnt_flush_, (unsigned long)cnt_flush_dirty_,
+                (unsigned long)cnt_sb_hit_, (unsigned long)cnt_sb_fill_,
+                (unsigned long)cnt_wt_noalloc_,
                 (unsigned long)lat_sum_, (unsigned long)lat_b1_, (unsigned long)lat_clamp_,
                 (unsigned long)n_clamp_, (unsigned long)lat_winfo_, (unsigned long)lat_wcommit_);
         vp::Component::stop();
@@ -154,6 +156,15 @@ private:
     // REQUIRED there for RTL-faithful miss throughput; on the calib TB it composes with the store's gate.
     int64_t sync_refill_busy_until_ = 0;
     int64_t ml_nominal_ = -1;
+    // No-allocate window (rlc_am doc/RLC_HW.md §2, the configured-window fallback): accesses
+    // whose GLOBAL (unrotated) address falls in [base, base+size) never allocate a way. Reads
+    // are served from a single-line stream buffer, refilled from L2 without installing; writes
+    // go write-through only. 0 size = disabled (default, behavior identical).
+    uint64_t noalloc_base_ = 0, noalloc_size_ = 0;
+    uint64_t sb_line_ = ~0ull;             // global line address held by the stream buffer
+    std::vector<uint8_t> sb_data_;
+    vp::IoReq sb_req_;
+    uint64_t cnt_sb_hit_ = 0, cnt_sb_fill_ = 0, cnt_wt_noalloc_ = 0;
     int32_t install_tail_cycles_ = 0;   // refill-pipeline tail after the response (occupancy, not latency)
 
     // --- state ---
@@ -267,6 +278,17 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
     num_cache_        = cfg->get_child_int("num_cache");
     num_tiles_        = cfg->get_child_int("num_tiles");
     num_private_cache_= cfg->get_child_int("num_private_cache");
+
+    // No-allocate window "base:size" (rlc_am doc/RLC_HW.md §2); empty = disabled.
+    {
+        const std::string na = cfg->get_child_str("noalloc");
+        unsigned long long b = 0, s = 0;
+        if (sscanf(na.c_str(), "%lli:%lli", (long long *)&b, (long long *)&s) == 2) {
+            noalloc_base_ = b;
+            noalloc_size_ = s;
+        }
+    }
+    sb_data_.assign(cache_line_bytes_, 0);
 
     geom_.init(cache_line_bytes_, num_ways_, num_sets_, cfg->get_child_bool("use_hash_way_select"), false);
     bank_.init(num_ways_, bank_factor);
@@ -472,6 +494,72 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
     }
 
     Decode d = decode_request(geom_, ways, addr, is_write);
+
+    // --- NO-ALLOCATE WINDOW (rlc_am doc/RLC_HW.md §2) --- an access whose GLOBAL address falls
+    // in the window never allocates a way. Payload and received-transport-block bytes stay out
+    // of the cache entirely: a read misses into the single-line stream buffer (refilled from L2
+    // through the same serialized refill gate, but with NO install and NO victim), and a write
+    // goes write-through only. A line the cache happens to hold VALID falls through to the
+    // ordinary hit paths — nothing in the window can *become* valid, so that is only a
+    // pre-window relic draining out. The stream buffer is invalidated by a window write to its
+    // line; the kernel's contract (bytes stable for the duration of the parse, dropped at every
+    // fence in real hardware) makes that sufficient.
+    if (noalloc_size_ != 0 && !d.is_hit) {
+        const uint64_t gaddr = l2_addr(addr);
+        if ((gaddr - noalloc_base_) < noalloc_size_) {
+            const uint64_t gline = gaddr & ~((uint64_t)cache_line_bytes_ - 1);
+            const uint32_t off = (uint32_t)(gaddr & (cache_line_bytes_ - 1));
+            uint32_t n = (uint32_t)req->get_size();
+            if (off + n > cache_line_bytes_) n = cache_line_bytes_ - off;
+
+            if (is_write && functional_writethrough_ && evict_itf_.is_bound()) {
+                if (sb_line_ == gline) sb_line_ = ~0ull;
+                functional_write_mem(req);
+                const int32_t wl = (write_hit_latency_cycles_ >= 0)
+                                       ? write_hit_latency_cycles_ : hit_latency_cycles_;
+                req->inc_latency(wl);
+                cnt_wt_noalloc_++;
+                lat_sum_ += (uint64_t)req->get_full_latency();
+                return vp::IO_REQ_OK;
+            }
+
+            if (!is_write && sb_line_ == gline) {
+                if (req->get_data() != nullptr)
+                    memcpy(req->get_data(), sb_data_.data() + off, n);
+                req->inc_latency(hit_latency_cycles_);
+                cnt_sb_hit_++;
+                lat_sum_ += (uint64_t)req->get_full_latency();
+                return vp::IO_REQ_OK;
+            }
+
+            // Fill the stream buffer: a real line fetch through the serialized refill gate —
+            // the bandwidth is the refill unit's — but no way is touched. Reads only; a write
+            // that could not go write-through above falls to the ordinary miss path.
+            if (!is_write) {
+                const int64_t issue =
+                    (sync_refill_busy_until_ > now) ? sync_refill_busy_until_ : now;
+                sb_req_.init();
+                sb_req_.set_addr(gline);
+                sb_req_.set_size(cache_line_bytes_);
+                sb_req_.set_is_write(false);
+                sb_req_.set_data(sb_data_.data());
+                if (refill_itf_.is_bound() &&
+                    refill_itf_.req(&sb_req_) == vp::IO_REQ_OK) {
+                    const int64_t full_lat = (int64_t)sb_req_.get_full_latency();
+                    if (ml_nominal_ < 0 || full_lat < ml_nominal_) ml_nominal_ = full_lat;
+                    sb_line_ = gline;
+                    if (req->get_data() != nullptr)
+                        memcpy(req->get_data(), sb_data_.data() + off, n);
+                    req->inc_latency((issue - now) + ml_nominal_);
+                    sync_refill_busy_until_ = issue + ml_nominal_;
+                    cnt_sb_fill_++;
+                    lat_sum_ += (uint64_t)req->get_full_latency();
+                    return vp::IO_REQ_OK;
+                }
+            }
+            // No refill path bound (standalone testbenches): fall through to the normal miss.
+        }
+    }
 
     // Write-commit serialization → ADDED latency on an OK (never DENY; the LSU cannot retry).
     if (is_write && write_commit_cycles_ > 1) {
