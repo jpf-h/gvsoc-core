@@ -29,7 +29,7 @@ class InsituCacheXbar(Component):
                  num_tiles: int = 1, tile_id: int = 0, num_private_cache: int | None = None,
                  dynamic_offset: int = 6, addr_width: int = 32, private_start_addr: int = 0,
                  xbar_latency_cycles: int = 0, enable_rotation: bool = False,
-                 forward_initiator: bool = False):
+                 forward_initiator: bool = False, regions: str = ''):
         super().__init__(parent, name)
 
         self.add_sources(['cache/insitu/insitu_cache_xbar.cpp'])
@@ -56,6 +56,10 @@ class InsituCacheXbar(Component):
             'xbar_latency_cycles': xbar_latency_cycles,
             'enable_rotation': enable_rotation,
             'forward_initiator': forward_initiator,
+            # Placed regions "base:size:tile_shift:bank_shift[,...]" — address windows whose
+            # TileID/BankSel routing fields sit at configured bit positions (route.hpp). Empty =
+            # flat routing everywhere (today's behavior).
+            'regions': regions,
         })
 
     def i_INPUT(self, port: int) -> SlaveItf:

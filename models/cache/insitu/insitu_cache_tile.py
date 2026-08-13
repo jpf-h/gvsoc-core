@@ -208,11 +208,9 @@ class InsituCacheTile(Component):
                 dynamic_offset=dyn_off, addr_width=config.addr_width,
                 xbar_latency_cycles=getattr(config, 'xbar_latency_cycles', 0),
                 enable_rotation=en_rot,
-                # E3.4: RTL reset value of the private boundary (used only in mixed partition mode;
-                # unobservable in all-shared/all-private so the default stays byte-identical). SW
-                # that calls l1d_part without l1d_addr relies on this RESVAL. E3.5: overridable
-                # via config.private_start_addr (calib TB frozen partition).
-                private_start_addr=_priv_start))
+                # E3.4: RTL reset value of the private boundary (mixed mode); E3.5 override.
+                private_start_addr=_priv_start,
+                regions=getattr(config, 'regions', '')))
 
         use_coal = getattr(config, 'cell_coalescer', False)
         n_vlsu = n_ppc - 1   # lanes 0..n_ppc-2 = Spatz VLSU; the last lane (n_ppc-1) = Snitch/FPU scalar

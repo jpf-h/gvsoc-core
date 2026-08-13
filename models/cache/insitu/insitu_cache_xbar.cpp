@@ -77,7 +77,8 @@ InsituCacheXbar::InsituCacheXbar(vp::ComponentConf &conf) : vp::Component(conf)
     geom_.init(/*n_cache*/num_cache_, /*n_remote*/num_remote_port_,
                /*n_cores*/cfg->get_child_int("num_cores"), /*n_tiles*/cfg->get_child_int("num_tiles"),
                /*dyn_offset*/cfg->get_child_int("dynamic_offset"), /*addr_w*/cfg->get_child_int("addr_width"),
-               /*priv_start*/priv_start);
+                /*priv_start*/priv_start);
+    geom_.parse_regions(cfg->get_child_str("regions").c_str());
 
     inputs_.resize(num_inputs_);
     outputs_.resize(num_outputs_);

@@ -457,6 +457,12 @@ class InsituCacheTileConfig:
     # log2(cache_line_bytes) (rotation must not move line-offset bits). The banks unrotate every
     # L2-side egress (refill/evict/functional-WT) via route.hpp::unrotate_addr. False = pre-E1.
     enable_rotation: bool = True
+    # Placed regions "base:size:tile_shift:bank_shift[,...]" — address windows whose
+    # TileID/BankSel routing fields sit at configured bit positions instead of the flat slice
+    # (route.hpp PlacedRegion; ManyRVData rlc_am doc/RLC_HW.md §1). Broadcast to every tile xbar
+    # AND the remote xbars — a region defines what an address means, so every router must agree.
+    # Empty = flat routing everywhere.
+    regions: str = ''
     controller: InsituCacheControllerConfig = field(
         default_factory=InsituCacheControllerConfig)
     coalescer: InsituCacheCoalescerConfig = field(

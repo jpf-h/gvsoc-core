@@ -25,7 +25,8 @@ class InsituCacheRemoteXbar(Component):
 
     def __init__(self, parent: Component, name: str, *,
                  num_tiles: int, num_cores: int, num_cache: int, num_remote_port_core: int = 1,
-                 dynamic_offset: int = 6, addr_width: int = 32, hop_latency_cycles: int = 0):
+                 dynamic_offset: int = 6, addr_width: int = 32, hop_latency_cycles: int = 0,
+                 regions: str = ''):
         super().__init__(parent, name)
         self.add_sources(['cache/insitu/insitu_cache_remote_xbar.cpp'])
         self.add_properties({
@@ -36,6 +37,9 @@ class InsituCacheRemoteXbar(Component):
             'dynamic_offset': dynamic_offset,
             'addr_width': addr_width,
             'hop_latency_cycles': hop_latency_cycles,
+            # Placed regions, same format/semantics as InsituCacheXbar (route.hpp). The remote
+            # xbar must hold the same value: it routes by the same effective TileID.
+            'regions': regions,
         })
 
     def i_INPUT(self, slot: int) -> SlaveItf:

@@ -34,6 +34,8 @@
 
 #pragma once
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 namespace insitu {
 
@@ -55,6 +57,28 @@ inline uint32_t bits_to_rotate(uint32_t bank_port, uint32_t num_private_cache, u
     return (bank_port < num_private_cache) ? cache_bank_bits                   // mixed: private
                                            : (cache_bank_bits + tile_bits);    // mixed: shared
 }
+
+// One placed region (ManyRVData rlc_am doc/RLC_HW.md §1): an address window whose TileID and
+// BankSel routing fields sit at CONFIGURED bit positions instead of the flat
+// [dyn_offset +: bank][.. +: tile] slice — so one tile owns one contiguous block (TileID at a
+// coarse bit, e.g. 19) while consecutive lines inside it still round-robin that tile's banks
+// (BankSel at the cacheline bit). Addresses matching no region keep today's flat behavior, so
+// every existing kernel is unaffected. Priority-encoded, up to four, matching the RTL sketch's
+// register interface; here they are elaboration-time configuration (the RTL writes them once
+// from one core and broadcasts — the model just starts with them written).
+//
+// The MSB rotation is deliberately UNTOUCHED for region-matched requests: it is a bijection on
+// the full address applied identically on the bank's ingress and inverted on its L2 egress, so
+// which bank a request routed to does not affect correctness — and for a region the varying
+// intra-block bits are exactly the ones that land in the set index, so there is no capacity
+// collapse either.
+struct PlacedRegion {
+    bool     en         = false;
+    uint64_t base       = 0;
+    uint64_t size       = 0;
+    uint32_t tile_shift = 0;   // TileID  at addr[tile_shift +: log2(tiles)]
+    uint32_t bank_shift = 0;   // BankSel at addr[bank_shift +: log2(banks)]
+};
 
 // Geometry + runtime CSRs of one tile's tcdm_cache_interco. All widths in bits; addresses byte-addressed.
 struct RouteGeom {
@@ -81,6 +105,39 @@ struct RouteGeom {
 
     static uint32_t log2_up(uint32_t v) { uint32_t b = 0; while ((1u << b) < v) b++; return b; }
 
+    // Placed regions (see PlacedRegion above). Empty by default: flat routing everywhere.
+    static constexpr uint32_t max_regions = 4;
+    PlacedRegion regions[max_regions];
+
+    // Parse "base:size:tile_shift:bank_shift[,...]" (numbers via strtoull base 0, so 0x works).
+    // Returns how many regions were configured; a malformed clause stops the parse.
+    uint32_t parse_regions(const char *spec) {
+        uint32_t n = 0;
+        if (spec == nullptr) return 0;
+        while (*spec != '\0' && n < max_regions) {
+            char *end = nullptr;
+            const uint64_t base = strtoull(spec, &end, 0);
+            if (end == spec || *end != ':') break;
+            spec = end + 1;
+            const uint64_t size = strtoull(spec, &end, 0);
+            if (end == spec || *end != ':') break;
+            spec = end + 1;
+            const uint64_t tsh = strtoull(spec, &end, 0);
+            if (end == spec || *end != ':') break;
+            spec = end + 1;
+            const uint64_t bsh = strtoull(spec, &end, 0);
+            if (end == spec) break;
+            regions[n].en = true;
+            regions[n].base = base;
+            regions[n].size = size;
+            regions[n].tile_shift = (uint32_t)tsh;
+            regions[n].bank_shift = (uint32_t)bsh;
+            ++n;
+            spec = (*end == ',') ? end + 1 : end;
+        }
+        return n;
+    }
+
     uint32_t addr_bank(uint64_t addr) const {
         return cache_bank_bits ? (uint32_t)((addr >> dyn_offset) & (((uint64_t)1 << cache_bank_bits) - 1)) : 0;
     }
@@ -88,11 +145,29 @@ struct RouteGeom {
         return tile_id_width ? (uint32_t)((addr >> (dyn_offset + cache_bank_bits)) & (((uint64_t)1 << tile_id_width) - 1)) : 0;
     }
 
+    // The effective {BankSel, TileID} of an address: a matching placed region's configured bit
+    // positions, else the flat slice. This is THE routing decision both xbars consult.
+    void routing_fields(uint64_t addr, uint32_t &bank, uint32_t &tile) const {
+        for (uint32_t i = 0; i < max_regions; ++i) {
+            const PlacedRegion &r = regions[i];
+            if (r.en && (addr - r.base) < r.size) {
+                bank = cache_bank_bits
+                     ? (uint32_t)((addr >> r.bank_shift) & (((uint64_t)1 << cache_bank_bits) - 1)) : 0;
+                tile = tile_id_width
+                     ? (uint32_t)((addr >> r.tile_shift) & (((uint64_t)1 << tile_id_width) - 1)) : 0;
+                return;
+            }
+        }
+        bank = addr_bank(addr);
+        tile = addr_tile(addr);
+    }
+
     // tcdm_cache_interco.sv:219-267 — request input-side routing.
     ReqRoute route_request(uint64_t addr, uint32_t tile_id, uint32_t num_private_cache) const {
         ReqRoute r;
-        const uint32_t ab = addr_bank(addr);
-        const uint32_t at = addr_tile(addr);
+        uint32_t ab = 0;
+        uint32_t at = 0;
+        routing_fields(addr, ab, at);
         const uint32_t num_shared = num_cache - num_private_cache;
         if (num_private_cache == num_cache || num_tiles == 1) {        // all-private / single-tile
             r.local = true; r.sel = ab;

@@ -56,6 +56,7 @@ InsituCacheRemoteXbar::InsituCacheRemoteXbar(vp::ComponentConf &conf) : vp::Comp
                /*n_cores*/cfg->get_child_int("num_cores"), /*n_tiles*/num_tiles_,
                /*dyn_offset*/cfg->get_child_int("dynamic_offset"), /*addr_w*/cfg->get_child_int("addr_width"),
                /*priv_start*/0);
+    geom_.parse_regions(cfg->get_child_str("regions").c_str());
 
     inputs_.resize(n_slots_);
     outputs_.resize(n_slots_);
@@ -95,7 +96,9 @@ vp::IoReqStatus InsituCacheRemoteXbar::req_handler(vp::Block *__this, vp::IoReq 
     // target, pin the slot by source-tile-mod-N (RTL group.sv:285-295). The GVSoC response auto-routes
     // back along the preserved resp-port chain, so the exact slot is a timing/contention choice only.
     const uint32_t source = (uint32_t)input_id / _this->nrpc_;
-    uint32_t target = _this->geom_.addr_tile(req->get_addr());
+    uint32_t bank_unused = 0;
+    uint32_t target = 0;
+    _this->geom_.routing_fields(req->get_addr(), bank_unused, target);
     if (target >= _this->num_tiles_) target = _this->num_tiles_ - 1;   // safety clamp
     const uint32_t out = target * _this->nrpc_ + (source % _this->nrpc_);
     if (_this->hop_latency_cycles_ > 0) req->inc_latency(_this->hop_latency_cycles_);
