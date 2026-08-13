@@ -691,7 +691,9 @@ class Rv32a(IsaSubset):
             Instr('amomin.w' ,  Format_AMO,   '10000 -- ----- ----- 010 ----- 0101111'),
             Instr('amomax.w' ,  Format_AMO,   '10100 -- ----- ----- 010 ----- 0101111'),
             Instr('amominu.w',  Format_AMO,   '11000 -- ----- ----- 010 ----- 0101111'),
-            Instr('amomaxu.w',  Format_AMO,   '11100 -- ----- ----- 010 ----- 0101111')
+            Instr('amomaxu.w',  Format_AMO,   '11100 -- ----- ----- 010 ----- 0101111'),
+            # Zacas compare-and-swap: rd carries the compare value in and the old value out.
+            Instr('amocas.w' ,  Format_AMO,   '00101 -- ----- ----- 010 ----- 0101111')
         ], includes=[
             '<cpu/iss/include/isa/rv32a.hpp>',
         ])

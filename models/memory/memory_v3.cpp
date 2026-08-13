@@ -394,6 +394,29 @@ vp::IoReqStatus Memory::handle_atomic(uint64_t addr, uint64_t size, uint8_t *in_
             result = (uint64_t) prev_val < (uint64_t) operand ? prev_val : operand; break;
         case vp::IoReqOpcode::MAXU:
             result = (uint64_t) prev_val > (uint64_t) operand ? prev_val : operand; break;
+        case vp::IoReqOpcode::CAS:
+        {
+            // Zacas amocas: out_data (aliasing rd) carries the compare value in and
+            // the old value out; the write happens only on a match.
+            int64_t compare = 0;
+            if (out_data != nullptr)
+            {
+                memcpy((uint8_t *)&compare, out_data, size);
+                if (size < 8)
+                {
+                    compare = get_signed_value(compare, size*8);
+                }
+            }
+            if (prev_val == compare)
+            {
+                result = operand;
+            }
+            else
+            {
+                is_write = false;
+            }
+            break;
+        }
         default:
             return vp::IO_REQ_DONE;
     }

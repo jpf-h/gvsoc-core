@@ -45,6 +45,21 @@ static inline iss_reg_t sc_w_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
     return iss_insn_next(iss, insn, pc);
 }
 
+static inline iss_reg_t amocas_w_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
+{
+    // Zacas amocas.w: rd holds the compare value and receives the old value; rs2 is
+    // the swap value. The LSU convention already routes rs2 through get_data() and
+    // aliases rd through get_second_data(), so the compare value travels in place —
+    // the memory side reads it from second_data before overwriting it with the old
+    // value (insitu_cache_amo_shim.cpp, memory.cpp).
+    if (iss->lsu.atomic(insn, REG_GET(0), 4, REG_IN(1), REG_OUT(0), vp::IoReqOpcode::CAS))
+    {
+        // This returns true if the core didn't manage to do the access and is stalled.
+        return pc;
+    }
+    return iss_insn_next(iss, insn, pc);
+}
+
 static inline iss_reg_t amoswap_w_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
     if (iss->lsu.atomic(insn, REG_GET(0), 4, REG_IN(1), REG_OUT(0), vp::IoReqOpcode::SWAP))

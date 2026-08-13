@@ -42,7 +42,8 @@ namespace insitu {
 
 enum AmoOp {
     AMO_NONE = 0x0, AMO_SWAP = 0x1, AMO_ADD = 0x2, AMO_AND = 0x3, AMO_OR = 0x4, AMO_XOR = 0x5,
-    AMO_MAX = 0x6, AMO_MAXU = 0x7, AMO_MIN = 0x8, AMO_MINU = 0x9, AMO_LR = 0xA, AMO_SC = 0xB
+    AMO_MAX = 0x6, AMO_MAXU = 0x7, AMO_MIN = 0x8, AMO_MINU = 0x9, AMO_LR = 0xA, AMO_SC = 0xB,
+    AMO_CAS = 0xC   // Zacas amocas: conditional swap, no write on mismatch (shim-handled)
 };
 
 inline bool amo_is_true(uint8_t op) { return op >= AMO_SWAP && op <= AMO_MINU; }   // Swap..Minu
@@ -51,6 +52,7 @@ inline bool amo_is_true(uint8_t op) { return op >= AMO_SWAP && op <= AMO_MINU; }
 inline uint32_t amo_alu(uint8_t op, uint32_t a, uint32_t b) {
     switch (op) {
     case AMO_SWAP: return b;
+    case AMO_CAS:  return b;   // reached only when the compare matched (shim gates the write)
     case AMO_ADD:  return (uint32_t)(a + b);
     case AMO_AND:  return a & b;
     case AMO_OR:   return a | b;

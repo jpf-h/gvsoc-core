@@ -50,6 +50,7 @@ inline uint8_t opcode_to_amo(vp::IoReqOpcode op)
     case vp::MAX:  return AMO_MAX;
     case vp::MINU: return AMO_MINU;
     case vp::MAXU: return AMO_MAXU;
+    case vp::CAS:  return AMO_CAS;
     default:       return AMO_NONE;
     }
 }
@@ -85,7 +86,7 @@ private:
     vp::IoReq *orig_ = nullptr;   // the held upstream AMO/SC request
     uint8_t  amo_op_ = AMO_NONE;
     uint64_t amo_addr_ = 0;
-    uint32_t old_val_ = 0, b_val_ = 0;
+    uint32_t old_val_ = 0, b_val_ = 0, cas_cmp_ = 0;
     uint8_t  scratch_buf_[8];     // value buffer for the scratch read/write
     vp::IoReq scratch_;
 
@@ -96,6 +97,13 @@ private:
     int64_t  rmw_busy_until_ = 0;
     int64_t  rmw_read_lat_ = 0;   // the scratch read's latency (captured before scratch_ re-init)
     int32_t  rmw_write_rtt_cycles_ = 8;
+    // Cap on one op's window contribution (see the .py). The requester's own
+    // latency is never capped — only the hold the NEXT requests wait out.
+    // Uncapped chaining by measured latencies double-charges queueing (the
+    // waiters were already stamped their wait) and feeds back: delayed
+    // requests bunch, downstream latencies rise, windows grow — observed as
+    // megacycle stalls on AMO-dense phases (rlc_am doc/PLAN.md item 77).
+    int64_t  rmw_window_cap_cycles_ = 128;
 
     vp::IoSlave  input_;
     vp::IoMaster output_;
@@ -113,6 +121,8 @@ InsituCacheAmo::InsituCacheAmo(vp::ComponentConf &conf) : vp::Component(conf)
     // (read-hit ~10 + 1 + 8 ≈ 19 cy end-to-end, matching the RTL's ~15-20 cy).
     int32_t wrtt = cfg->get_child_int("amo_rmw_write_rtt_cycles");
     if (wrtt >= 0) rmw_write_rtt_cycles_ = wrtt;
+    int32_t wcap = cfg->get_child_int("amo_rmw_window_cap_cycles");
+    if (wcap >= 0) rmw_window_cap_cycles_ = wcap;
 
     input_.set_req_meth(&InsituCacheAmo::req_handler);
     this->new_slave_port("input", &input_);
@@ -187,6 +197,11 @@ vp::IoReqStatus InsituCacheAmo::req_handler(vp::Block *__this, vp::IoReq *req)
     _this->amo_op_  = opcode_to_amo(op);
     _this->amo_addr_= addr;
     memcpy(&_this->b_val_, req->get_data(), 4);       // the store operand
+    // amocas (Zacas): the compare value travels in second_data — the very
+    // register the old value is returned through (rv32a.hpp) — so it is read
+    // here, before the completion path overwrites it.
+    if (_this->amo_op_ == AMO_CAS && req->get_second_data() != nullptr)
+        memcpy(&_this->cas_cmp_, req->get_second_data(), 4);
     _this->scratch_.init();
     _this->scratch_.set_addr(addr);
     _this->scratch_.set_size(req->get_size());
@@ -207,6 +222,30 @@ void InsituCacheAmo::resp_handler(vp::Block *__this, vp::IoReq *req)
     if (_this->phase_ == AMO_READ) {
         memcpy(&_this->old_val_, _this->scratch_buf_, 4);
         _this->rmw_read_lat_ = _this->scratch_.get_full_latency();   // B3: before scratch_ re-init
+        // amocas: a mismatch performs no write at all (Zacas). The old value
+        // still returns through the completion path below; the lane pays the
+        // read plus one cycle rather than the full write-back RTT.
+        if (_this->amo_op_ == AMO_CAS && _this->old_val_ != _this->cas_cmp_) {
+            vp::IoReq *orig = _this->orig_;
+            uint8_t *result_dst = (orig != nullptr && orig->get_second_data() != nullptr)
+                                  ? orig->get_second_data() : (orig != nullptr ? orig->get_data() : nullptr);
+            if (result_dst != nullptr) memcpy(result_dst, &_this->old_val_, 4);
+            _this->phase_ = IDLE;
+            _this->orig_ = nullptr;
+            if (orig != nullptr) {
+                const int64_t total = _this->rmw_read_lat_ + 1;
+                orig->inc_latency(total);
+                const int64_t now2 = _this->clock.get_cycles();
+                const int64_t hold = total < _this->rmw_window_cap_cycles_
+                                     ? total : _this->rmw_window_cap_cycles_;
+                _this->rmw_busy_until_ = (_this->rmw_busy_until_ > now2 ? _this->rmw_busy_until_ : now2) + hold;
+                _this->rmw_read_lat_ = 0;
+                _this->n_rmw_++; _this->lat_rmw_sum_ += (uint64_t)orig->get_full_latency();
+            }
+            if (_this->in_sync_call_) _this->sync_completed_ = true;
+            else if (orig != nullptr) orig->get_resp_port()->resp(orig);
+            return;
+        }
         const uint32_t newv = amo_alu(_this->amo_op_, _this->old_val_, _this->b_val_);
         memcpy(_this->scratch_buf_, &newv, 4);
         _this->phase_ = AMO_WRITE;
@@ -246,7 +285,9 @@ void InsituCacheAmo::resp_handler(vp::Block *__this, vp::IoReq *req)
             : (_this->scratch_.get_full_latency() + _this->rmw_write_rtt_cycles_);
         orig->inc_latency(total);
         const int64_t now = _this->clock.get_cycles();
-        _this->rmw_busy_until_ = (_this->rmw_busy_until_ > now ? _this->rmw_busy_until_ : now) + total;
+        const int64_t hold = total < _this->rmw_window_cap_cycles_
+                             ? total : _this->rmw_window_cap_cycles_;
+        _this->rmw_busy_until_ = (_this->rmw_busy_until_ > now ? _this->rmw_busy_until_ : now) + hold;
         _this->rmw_read_lat_ = 0;
         _this->n_rmw_++; _this->lat_rmw_sum_ += (uint64_t)orig->get_full_latency();
     }

@@ -5,3 +5,4 @@ cscope*
 /docs/_build/
 /.vscode/
 build/
+models/memory/dramsys_configs
