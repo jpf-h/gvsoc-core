@@ -29,7 +29,8 @@ class InsituCacheXbar(Component):
                  num_tiles: int = 1, tile_id: int = 0, num_private_cache: int | None = None,
                  dynamic_offset: int = 6, addr_width: int = 32, private_start_addr: int = 0,
                  xbar_latency_cycles: int = 0, enable_rotation: bool = False,
-                 forward_initiator: bool = False, regions: str = ''):
+                 forward_initiator: bool = False, regions: str = '',
+                 noalloc: str = '', line_bytes: int = 64):
         super().__init__(parent, name)
 
         self.add_sources(['cache/insitu/insitu_cache_xbar.cpp'])
@@ -60,6 +61,11 @@ class InsituCacheXbar(Component):
             # TileID/BankSel routing fields sit at configured bit positions (route.hpp). Empty =
             # flat routing everywhere (today's behavior).
             'regions': regions,
+            # No-allocate window "base:size[:pf_port]" — requester-side per-core-port stream
+            # buffers for window reads, and the optional posted-prefetch port word
+            # (drivers/hint.h, doc/RLC_HW.md §2). Empty = no buffers (today's behavior).
+            'noalloc': noalloc,
+            'line_bytes': line_bytes,
         })
 
     def i_INPUT(self, port: int) -> SlaveItf:
