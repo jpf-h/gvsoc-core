@@ -43,6 +43,12 @@ void Exec::build()
     this->offload_grant_itf.set_sync_meth(&Exec::offload_grant);
     this->iss.top.new_slave_port("offload_grant", &this->offload_grant_itf, (vp::Block *)this);
 
+    // Initialized here, not only in reset(true): the shared icache's own reset can fire the
+    // flush-ack And gate at every core BEFORE this core's reset has run (reset_all order), and a
+    // stale true here then decrements a zero stall counter — the "Trying to decrease zero
+    // stalled counter" fatal seen at 128+ cores, where reset ordering and uninitialized memory
+    // differ from the small configurations.
+    this->cache_sync = false;
     flush_cache_ack_itf.set_sync_meth(&Exec::flush_cache_ack_sync);
     this->iss.top.new_slave_port("flush_cache_ack", &flush_cache_ack_itf, (vp::Block *)this);
     this->iss.top.new_master_port("flush_cache_req", &flush_cache_req_itf);

@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <climits>
 #include <string>
 #include <vector>
 
@@ -69,8 +70,19 @@ private:
         uint64_t line = ~0ull;
         int64_t  ready_cycle = 0;
         std::vector<uint8_t> data;
+        // A fill that went PENDING at the home bank: its request stays in flight and its
+        // response must land HERE — never on a core that has nothing outstanding (the ISS
+        // aborts: "Trying to decrease zero stalled counter"). One fill per buffer; a demand read
+        // that started or met the fill parks as `waiter` and is answered from `fill_resp`.
+        vp::IoReq fill_req;
+        bool      filling = false;
+        uint64_t  fill_addr = ~0ull;
+        vp::IoReq *waiter = nullptr;
+        uint32_t  waiter_off = 0, waiter_n = 0;
     };
-    int64_t fill_line(uint64_t line_addr, uint8_t *dst);
+    enum { FILL_FAILED = -1, FILL_PENDING = -2 };
+    int64_t fill_line(StreamBuf &buf, uint64_t line_addr);
+    static void fill_resp(vp::Block *__this, vp::IoReq *req);
     uint32_t route_out(uint64_t addr, uint64_t *routed_addr);
 
     RouteGeom geom_;
@@ -83,7 +95,7 @@ private:
 
     uint64_t  na_base_ = 0, na_size_ = 0, pf_addr_ = 0;
     uint32_t  line_bytes_ = 64;
-    std::vector<StreamBuf> bufs_;
+    StreamBuf *bufs_ = nullptr;
     uint64_t  cnt_sb_hit_ = 0, cnt_sb_fill_ = 0, cnt_sb_wait_ = 0;
     uint64_t  cnt_pf_ = 0, cnt_pf_late_ = 0, cnt_inval_ = 0;
 
@@ -91,7 +103,6 @@ private:
     std::vector<vp::IoMaster *> outputs_;
     vp::IoSlave config_;
     vp::IoReq split_subreq_;
-    vp::IoReq fill_req_;
     vp::Trace trace_;
 };
 
@@ -131,8 +142,8 @@ InsituCacheXbar::InsituCacheXbar(vp::ComponentConf &conf) : vp::Component(conf)
             pf_addr_ = p;   // 0 when the third field is absent: no prefetch port.
         }
         if (na_size_ != 0) {
-            bufs_.resize(num_cores_);
-            for (auto &buf : bufs_) buf.data.assign(line_bytes_, 0);
+            bufs_ = new StreamBuf[num_cores_];
+            for (uint32_t c = 0; c < num_cores_; ++c) bufs_[c].data.assign(line_bytes_, 0);
         }
     }
 
@@ -145,6 +156,9 @@ InsituCacheXbar::InsituCacheXbar(vp::ComponentConf &conf) : vp::Component(conf)
     }
     for (uint32_t o = 0; o < num_outputs_; ++o) {
         outputs_[o] = new vp::IoMaster();
+        // Responses to requests THIS component issues (the line fills) come back here;
+        // forwarded core requests keep their own originator and are unaffected.
+        outputs_[o]->set_resp_meth(&InsituCacheXbar::fill_resp);
         this->new_master_port("out_" + std::to_string(o), outputs_[o]);
     }
 
@@ -196,21 +210,54 @@ uint32_t InsituCacheXbar::route_out(uint64_t addr, uint64_t *routed_addr)
     return out_id;
 }
 
-// One whole-line fetch through the normal routed path, synchronously; the home bank serves a
-// window read from L2 without installing (insitu_cache_core.cpp). Returns the fetch's latency
-// in cycles, or -1 when the path could not complete synchronously (the caller falls back to
-// forwarding the original request untouched).
-int64_t InsituCacheXbar::fill_line(uint64_t line_addr, uint8_t *dst)
+// One whole-line fetch through the normal routed path; the home bank serves a window read from
+// L2 without installing (insitu_cache_core.cpp). Returns the fetch's latency when it completed in
+// the call, FILL_PENDING when the bank took it asynchronously (the buffer is then `filling`, and
+// fill_resp() finishes it), FILL_FAILED when the path refused it (the caller forwards the original
+// request untouched; no fill is in flight).
+int64_t InsituCacheXbar::fill_line(StreamBuf &buf, uint64_t line_addr)
 {
+    if (buf.filling) return FILL_FAILED;   // one in flight per buffer
     uint64_t routed = line_addr;
     const uint32_t out_id = route_out(line_addr, &routed);
-    fill_req_.init();
-    fill_req_.set_addr(routed);
-    fill_req_.set_size(line_bytes_);
-    fill_req_.set_is_write(false);
-    fill_req_.set_data(dst);
-    if (outputs_[out_id]->req_forward(&fill_req_) != vp::IO_REQ_OK) return -1;
-    return (int64_t)fill_req_.get_full_latency();
+    buf.fill_req.init();
+    buf.fill_req.set_addr(routed);
+    buf.fill_req.set_size(line_bytes_);
+    buf.fill_req.set_is_write(false);
+    buf.fill_req.set_data(buf.data.data());
+    const vp::IoReqStatus st = outputs_[out_id]->req(&buf.fill_req);
+    if (st == vp::IO_REQ_OK) return (int64_t)buf.fill_req.get_full_latency();
+    if (st == vp::IO_REQ_PENDING) {
+        buf.filling = true;
+        buf.fill_addr = line_addr;
+        buf.line = line_addr;
+        buf.ready_cycle = INT64_MAX;   // not before fill_resp
+        return FILL_PENDING;
+    }
+    return FILL_FAILED;
+}
+
+void InsituCacheXbar::fill_resp(vp::Block *__this, vp::IoReq *req)
+{
+    InsituCacheXbar *_this = static_cast<InsituCacheXbar *>(__this);
+    for (uint32_t c = 0; c < _this->num_cores_; ++c) {
+        StreamBuf &buf = _this->bufs_[c];
+        if (&buf.fill_req != req) continue;
+        buf.filling = false;
+        if (buf.line == buf.fill_addr) {
+            buf.ready_cycle = _this->clock.get_cycles();
+        } else {
+            buf.line = ~0ull;   // invalidated by a window write while in flight
+        }
+        if (buf.waiter != nullptr) {
+            vp::IoReq *w = buf.waiter;
+            buf.waiter = nullptr;
+            if (w->get_data() != nullptr)
+                memcpy(w->get_data(), buf.data.data() + buf.waiter_off, buf.waiter_n);
+            w->get_resp_port()->resp(w);
+        }
+        return;
+    }
 }
 
 vp::IoReqStatus InsituCacheXbar::req_handler(vp::Block *__this, vp::IoReq *req, int input_id)
@@ -231,12 +278,12 @@ vp::IoReqStatus InsituCacheXbar::req_handler(vp::Block *__this, vp::IoReq *req, 
                 StreamBuf &buf = _this->bufs_[input_id];
                 const uint64_t line = (uint64_t)target & ~((uint64_t)_this->line_bytes_ - 1);
                 if (buf.line != line) {
-                    const int64_t lat = _this->fill_line(line, buf.data.data());
+                    const int64_t lat = _this->fill_line(buf, line);
                     if (lat >= 0) {
                         buf.line = line;
                         buf.ready_cycle = _this->clock.get_cycles() + lat;
-                        _this->cnt_pf_++;
                     }
+                    if (lat != FILL_FAILED) _this->cnt_pf_++;
                 }
             }
             req->inc_latency(1);
@@ -248,8 +295,10 @@ vp::IoReqStatus InsituCacheXbar::req_handler(vp::Block *__this, vp::IoReq *req, 
                 // Same-tile window write: drop every local buffer holding the line, then fall
                 // through to the ordinary path (the bank writes through without allocating).
                 const uint64_t line = addr & ~((uint64_t)_this->line_bytes_ - 1);
-                for (auto &buf : _this->bufs_)
+                for (uint32_t c = 0; c < _this->num_cores_; ++c) {
+                    StreamBuf &buf = _this->bufs_[c];
                     if (buf.line == line) { buf.line = ~0ull; _this->cnt_inval_++; }
+                }
             } else {
                 const uint64_t line = addr & ~((uint64_t)_this->line_bytes_ - 1);
                 const uint32_t off = (uint32_t)(addr & (_this->line_bytes_ - 1));
@@ -257,7 +306,15 @@ vp::IoReqStatus InsituCacheXbar::req_handler(vp::Block *__this, vp::IoReq *req, 
                 if (off + n <= _this->line_bytes_) {
                     StreamBuf &buf = _this->bufs_[input_id];
                     const int64_t now = _this->clock.get_cycles();
-                    if (buf.line == line) {
+                    if (buf.line == line && buf.filling) {
+                        // A prefetch (or earlier read) is still in flight for this line: park
+                        // behind it if the slot is free, otherwise take the plain path.
+                        if (buf.waiter == nullptr) {
+                            buf.waiter = req; buf.waiter_off = off; buf.waiter_n = n;
+                            _this->cnt_sb_hit_++; _this->cnt_pf_late_++;
+                            return vp::IO_REQ_PENDING;
+                        }
+                    } else if (buf.line == line) {
                         const int64_t wait = (buf.ready_cycle > now) ? buf.ready_cycle - now : 0;
                         if (wait > 0) { _this->cnt_sb_wait_ += (uint64_t)wait; _this->cnt_pf_late_++; }
                         if (req->get_data() != nullptr)
@@ -266,17 +323,24 @@ vp::IoReqStatus InsituCacheXbar::req_handler(vp::Block *__this, vp::IoReq *req, 
                         _this->cnt_sb_hit_++;
                         return vp::IO_REQ_OK;
                     }
-                    const int64_t lat = _this->fill_line(line, buf.data.data());
-                    if (lat >= 0) {
-                        buf.line = line;
-                        buf.ready_cycle = now + lat;
-                        if (req->get_data() != nullptr)
-                            memcpy(req->get_data(), buf.data.data() + off, n);
-                        req->inc_latency(_this->xbar_latency_cycles_ + 1 + lat);
-                        _this->cnt_sb_fill_++;
-                        return vp::IO_REQ_OK;
+                    if (!buf.filling) {
+                        const int64_t lat = _this->fill_line(buf, line);
+                        if (lat >= 0) {
+                            buf.line = line;
+                            buf.ready_cycle = now + lat;
+                            if (req->get_data() != nullptr)
+                                memcpy(req->get_data(), buf.data.data() + off, n);
+                            req->inc_latency(_this->xbar_latency_cycles_ + 1 + lat);
+                            _this->cnt_sb_fill_++;
+                            return vp::IO_REQ_OK;
+                        }
+                        if (lat == FILL_PENDING) {
+                            buf.waiter = req; buf.waiter_off = off; buf.waiter_n = n;
+                            _this->cnt_sb_fill_++;
+                            return vp::IO_REQ_PENDING;
+                        }
                     }
-                    // Fill failed (asynchronous path): fall through to plain forwarding.
+                    // Fill refused, or another line's fill occupies the buffer: plain path.
                 }
             }
         }

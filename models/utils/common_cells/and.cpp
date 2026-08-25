@@ -64,7 +64,10 @@ And::And(vp::ComponentConf &config)
 
     this->nb_values = (nb_input + 63) / 64;
 
-    this->last_value_mask = ~((1 << (nb_input % 64)) - 1);
+    // 64-bit shifts: inputs 31..63 of a word used `1 << bit` as an int — bit 31 is INT_MIN
+    // and sign-extends into all upper bits, so a 129-input gate (128 cores + 1 bank) reads
+    // "all acked" at reset and every core gets a flush-ack it never asked for.
+    this->last_value_mask = (nb_input % 64) ? ~((1ULL << (nb_input % 64)) - 1ULL) : 0ULL;
 
     this->values.resize(this->nb_values);
 }
@@ -95,11 +98,11 @@ void And::sync(vp::Block *__this, bool value, int id)
 
     if (value)
     {
-        _this->values[value_byte] |= 1 << value_bit;
+        _this->values[value_byte] |= 1ULL << value_bit;
     }
     else
     {
-        _this->values[value_byte] &= ~(1 << value_bit);
+        _this->values[value_byte] &= ~(1ULL << value_bit);
     }
 
     if (_this->values[value_byte] == -1)
