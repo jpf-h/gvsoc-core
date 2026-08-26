@@ -449,6 +449,16 @@ int fds_t::lookup(iss_reg_t fd)
   return fd >= fds.size() ? -1 : fds[fd];
 }
 
+void Htif::notify_tohost_store()
+{
+#ifdef CONFIG_GVSOC_ISS_HTIF
+    if (this->tohost_addr != 0 && !this->htif_event.is_enqueued())
+    {
+        this->htif_event.enqueue(1);
+    }
+#endif
+}
+
 void Htif::reset(bool active)
 {
     if (active)
@@ -479,5 +489,6 @@ void Htif::htif_handler(vp::Block *__this, vp::ClockEvent *event)
         }
     }
 
-    iss->syscalls.htif.htif_event.enqueue(1000);
+    // No periodic re-arm: event-driven via notify_tohost_store() (a per-1000-cycle
+    // poll through the timed cache fabric saturated the tohost home bank at 256 cores).
 }

@@ -104,6 +104,12 @@ class Htif
 {
 
 public:
+    // Store-side interception (event-driven HTIF): the LSU calls this when the target
+    // stores to the tohost word; the handler then runs once, next cycle, instead of a
+    // periodic poll. Keeps the host side out of the modeled memory system entirely.
+    void notify_tohost_store();
+    inline iss_reg_t get_tohost_addr() { return this->tohost_addr; }
+
     Htif(IssWrapper &top, Iss &iss);
 
     void build();

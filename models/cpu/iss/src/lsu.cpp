@@ -163,6 +163,17 @@ void Lsu::data_response(vp::Block *__this, vp::IoReq *req)
 
 int Lsu::data_req_aligned(iss_addr_t addr, uint8_t *data_ptr, uint8_t *memcheck_data, int size, bool is_write, int64_t &latency, int &req_id)
 {
+    // Event-driven HTIF: a store touching the tohost word wakes the host-side handler
+    // directly (next cycle, when this store has completed). The store itself proceeds
+    // into memory unchanged - tohost stays an ordinary memory word for the target.
+    if (is_write)
+    {
+        iss_reg_t th = this->iss.syscalls.htif.get_tohost_addr();
+        if (th != 0 && addr <= th && th < addr + (iss_addr_t)size)
+        {
+            this->iss.syscalls.htif.notify_tohost_store();
+        }
+    }
     this->trace.msg("Data request (addr: 0x%lx, size: 0x%x, is_write: %d)\n", addr, size, is_write);
     vp::IoReq *req = this->get_req();
     if (req == NULL)
