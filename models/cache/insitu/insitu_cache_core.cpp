@@ -473,6 +473,48 @@ vp::IoReqStatus InsituCacheCore::run_flush(vp::IoReq *req)
 // request is in flight (the cluster LSU is single-outstanding), so the refill needs no FIFO.
 vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
 {
+    // Debug/backdoor accesses (HTIF tohost pollers, gdbserver, syscall-argument reads) are
+    // timing-transparent by gvsoc contract: serve them straight from L2 (functional
+    // write-through keeps L2 current) and touch NO gate state, NO latency, NO way state.
+    // The per-core HTIF pollers otherwise read tohost through the timed path every 1000
+    // cycles; at 256 cores that alone saturates the tohost home bank's 1-op/cycle cell
+    // (~1+ arrival/cycle sustained) and its accept backlog diverges — the actual 256-core
+    // runaway driver (measured: 31M+ byte reads of tohost on one bank; ManyRVData rlc_am
+    // doc/PROFILING.md, 256-core investigation). The calibrated controller already
+    // bypasses debug requests the same way (insitu_cache_controller.cpp req_handler).
+    if (req->is_debug()) {
+        // The cached copy, when present, is the coherent one for BOTH directions: a debug
+        // write that only updated L2 would leave a stale VALID line that the target's own
+        // polling (HTIF tohost handshake) then reads forever. So: update/serve the cached
+        // line if the tag matches, and keep L2 current (writes always; reads only on miss).
+        const uint64_t dbg_addr = req->get_addr();
+        const uint32_t dbg_set = geom_.set_index(dbg_addr);
+        WayMeta *dbg_ways = set_ways(dbg_set);
+        const uint64_t dbg_tag = geom_.tag_of(dbg_addr);
+        int dbg_w = -1;
+        for (uint32_t i = 0; i < num_ways_; i++)
+            if (dbg_ways[i].status != INVALID && dbg_ways[i].tag == dbg_tag) { dbg_w = (int)i; break; }
+        if (dbg_w >= 0 && req->get_data() != nullptr) {
+            uint8_t *line = &data_[((size_t)dbg_set * num_ways_ + (uint32_t)dbg_w) * cache_line_bytes_
+                                   + (dbg_addr & (cache_line_bytes_ - 1))];
+            if (req->get_is_write()) memcpy(line, req->get_data(), req->get_size());
+            else                     memcpy(req->get_data(), line, req->get_size());
+        }
+        // NO downstream forward from here: issuing a request toward L2 from inside this
+        // entry point corrupts the composite L2 port's bookkeeping (three variants tried —
+        // forwarding the caller's req, a private req on the evict lane, and a private req on
+        // the refill lane — all eventually wedge a NORMAL store permanently mid-run; the
+        // forward-free variant is clean). The resulting contract is exact for the debug
+        // traffic that exists: HTIF words read zero until the target's first store installs
+        // the line (they ARE zero until then); syscall arguments and strings are written by
+        // the target immediately before the syscall, so their lines are present. A debug
+        // write-hit marks the line dirty so a later eviction writes the value back.
+        if (dbg_w >= 0 && req->get_is_write()) dbg_ways[dbg_w].dirty = true;
+        if (dbg_w < 0 && !req->get_is_write() && req->get_data() != nullptr)
+            memset(req->get_data(), 0, req->get_size());
+        return vp::IO_REQ_OK;
+    }
+
     const int64_t now = clock.get_cycles();
     const uint64_t addr = req->get_addr();
     const bool is_write = req->get_is_write();
