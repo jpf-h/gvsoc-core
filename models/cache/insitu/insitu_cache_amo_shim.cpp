@@ -142,14 +142,7 @@ vp::IoReqStatus InsituCacheAmo::req_handler(vp::Block *__this, vp::IoReq *req)
 
     // B3: a new request on this lane (any opcode) waits out the previous RMW's occupancy window.
     const int64_t now = _this->clock.get_cycles();
-    if (now < _this->rmw_busy_until_) {
-        // Same finite-queue bound as the bank's refill gate (insitu_cache_core.cpp): the lane's
-        // window chains per op, and at 256 cores the chain ran away with no requester able to
-        // have more than one request in it.
-        int64_t wait = _this->rmw_busy_until_ - now;
-        if (wait > 16384) { wait = 16384; _this->rmw_busy_until_ = now + 16384; }
-        req->inc_latency(wait);
-    }
+    if (now < _this->rmw_busy_until_) req->inc_latency(_this->rmw_busy_until_ - now);
 
     // --- plain accesses: pass through ---
     if (op == vp::READ) {
