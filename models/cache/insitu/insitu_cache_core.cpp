@@ -155,6 +155,13 @@ private:
     // The cachepool backing store (plain memory.cpp) does not serialize refills at all, so this gate is
     // REQUIRED there for RTL-faithful miss throughput; on the calib TB it composes with the store's gate.
     int64_t sync_refill_busy_until_ = 0;
+    // Finite refill queue. The synchronous gate chains every miss behind the previous one, and at
+    // high core counts the engine processes many cores' requests at one instant while the charged
+    // cores sit in the future — the backlog then grows without bound (observed: 7 M cycles for one
+    // remote amocas at 256 cores; the 64-tile "hang"). Hardware bounds it by construction: one
+    // outstanding request per core, so the queue can never exceed the core count. The cap stands
+    // in for that backpressure: no request is charged more than this many cycles of queue wait.
+    int64_t refill_backlog_cap_cycles_ = 16384;
     int64_t ml_nominal_ = -1;
     // No-allocate window (rlc_am doc/RLC_HW.md §2, the configured-window fallback): accesses
     // whose GLOBAL (unrotated) address falls in [base, base+size) never allocate a way. Reads
@@ -289,6 +296,7 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
         }
     }
     sb_data_.assign(cache_line_bytes_, 0);
+    { const int64_t c = cfg->get_child_int("refill_backlog_cap_cycles"); if (c > 0) refill_backlog_cap_cycles_ = c; }
 
     geom_.init(cache_line_bytes_, num_ways_, num_sets_, cfg->get_child_bool("use_hash_way_select"), false);
     bank_.init(num_ways_, bank_factor);
@@ -520,7 +528,15 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
     // cell's single request pipeline for one cycle (the 1-deep req_buf + pre-reader arbiter).
     // Contention folds into the response latency. D1 clamp waits below do NOT hold the cell (a
     // PEND-stalled request re-arbitrates after the wait — RTL: it waits in the xbar input spill).
-    const int64_t accept = (cell_busy_until_ > now) ? cell_busy_until_ : now;
+    int64_t accept = (cell_busy_until_ > now) ? cell_busy_until_ : now;
+    // Finite input queue. The cell accepts one request per cycle, so a bank hit by more than one
+    // request per cycle in sustained aggregate (250+ cores probing one bank at 256 cores) sees its
+    // accept cyclestamp run into the future without bound — the engine charges each request the full
+    // backlog and it never drains, because nothing throttles the source. Real hardware denies
+    // upstream (req_buf is 1-deep, the xbar spill fills, the core stalls with one request
+    // outstanding), which caps the in-flight depth at the core count by construction. The cap
+    // stands in for that backpressure (doc/PROFILING.md §4.18).
+    if (accept - now > refill_backlog_cap_cycles_) accept = now + refill_backlog_cap_cycles_;
     if (accept > now) { req->inc_latency(accept - now); lat_b1_ += (uint64_t)(accept - now); }
     cell_busy_until_ = accept + 1;
 
@@ -578,8 +594,9 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
             // the bandwidth is the refill unit's — but no way is touched. Reads only; a write
             // that could not go write-through above falls to the ordinary miss path.
             if (!is_write) {
-                const int64_t issue =
+                int64_t issue =
                     (sync_refill_busy_until_ > now) ? sync_refill_busy_until_ : now;
+                if (issue - now > refill_backlog_cap_cycles_) issue = now + refill_backlog_cap_cycles_;
                 sb_req_.init();
                 sb_req_.set_addr(gline);
                 sb_req_.set_size(cache_line_bytes_);
@@ -605,7 +622,11 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
 
     // Write-commit serialization → ADDED latency on an OK (never DENY; the LSU cannot retry).
     if (is_write && write_commit_cycles_ > 1) {
-        const int64_t accept = (write_commit_busy_until_ > now) ? write_commit_busy_until_ : now;
+        int64_t accept = (write_commit_busy_until_ > now) ? write_commit_busy_until_ : now;
+        // Same finite-queue bound as the refill gate: a bank's write queue is finite and every
+        // writer has one request outstanding, so the chain cannot legitimately run away. It did
+        // at 256 cores under the flat map, where every tile's control line shares one bank.
+        if (accept - now > refill_backlog_cap_cycles_) accept = now + refill_backlog_cap_cycles_;
         req->inc_latency(accept - now);
         lat_wcommit_ += (uint64_t)(accept - now);
         write_commit_busy_until_ = accept + write_commit_cycles_;
@@ -636,7 +657,8 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
         }
         if (ready < 0) break;                  // paranoia: no PEND line found — treat as miss
         const int64_t virt0 = now + req->get_full_latency();
-        if (ready > virt0) { req->inc_latency(ready - virt0); lat_clamp_ += (uint64_t)(ready - virt0); n_clamp_++; }
+        if (ready > virt0) {
+            req->inc_latency(ready - virt0); lat_clamp_ += (uint64_t)(ready - virt0); n_clamp_++; }
         if (d.is_hit_pend || d.is_hit_conflit) {
             serve_pend_way = (int)d.way;       // serve from the PEND line; NO install (see above)
             break;
@@ -726,7 +748,8 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
     // ready cycle (the previous miss's install+serve), so cold-miss throughput is ~1/(ML+pipeline) (RTL),
     // not ~1/ML. The refill is still issued to the store now for its DATA; the request's TIMING is stamped
     // from the controller-gated issue point using the store's nominal (ungated) latency.
-    const int64_t issue = (sync_refill_busy_until_ > now) ? sync_refill_busy_until_ : now;
+    int64_t issue = (sync_refill_busy_until_ > now) ? sync_refill_busy_until_ : now;
+    if (issue - now > refill_backlog_cap_cycles_) issue = now + refill_backlog_cap_cycles_;
 
     refill_req_.init();
     refill_req_.set_addr(l2_addr(addr_line(addr)));
