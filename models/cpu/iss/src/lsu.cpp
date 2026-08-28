@@ -22,6 +22,7 @@
 #include <vp/vp.hpp>
 #include "cpu/iss/include/iss.hpp"
 #include "cpu/iss/include/pcstat.hpp"
+#include "cpu/iss/include/stackguard.hpp"
 #include "vp/signal.hpp"
 
 void Lsu::reset(bool active)
@@ -172,6 +173,12 @@ void Lsu::data_response(vp::Block *__this, vp::IoReq *req)
 
 int Lsu::data_req_aligned(iss_addr_t addr, uint8_t *data_ptr, uint8_t *memcheck_data, int size, bool is_write, int64_t &latency, int &req_id)
 {
+    {
+        const stackguard::Guard &sg = stackguard::Guard::get();
+        if (__builtin_expect(sg.hits(addr, (uint64_t)size), 0))
+            sg.trip((uint32_t)this->iss.exec.current_insn, (uint32_t)this->iss.csr.mhartid,
+                    addr, (uint64_t)size, is_write);
+    }
     // Event-driven HTIF: a store touching the tohost word wakes the host-side handler
     // directly (next cycle, when this store has completed). The store itself proceeds
     // into memory unchanged - tohost stays an ordinary memory word for the target.
