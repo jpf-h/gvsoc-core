@@ -19,6 +19,7 @@
  * Authors: Germain Haugou, GreenWaves Technologies (germain.haugou@greenwaves-technologies.com)
  */
 
+#include <stdio.h>
 #include <vp/vp.hpp>
 #include <vp/queue.hpp>
 #include <vp/itf/io.hpp>
@@ -57,6 +58,19 @@ public:
 
     bool enabled = false;
     bool enabled_at_reset;
+
+    // Fetch/refill telemetry (dumped at stop(), one line per cache instance).
+    uint64_t cnt_access_ = 0;   // external requests entering the enabled cache
+    uint64_t cnt_refill_cnt_ = 0;  // lines actually fetched from the refill port
+
+    void stop() override
+    {
+        if (cnt_access_ || cnt_refill_cnt_)
+            fprintf(stderr, "[ICACHE %s] access=%lu refill=%lu\n",
+                    this->get_path().c_str(), (unsigned long)cnt_access_,
+                    (unsigned long)cnt_refill_cnt_);
+        vp::Component::stop();
+    }
 
 private:
     static void refill_event_clear_handler(vp::Block *__this, vp::ClockEvent *event);
@@ -256,6 +270,8 @@ cache_line_t *Cache::refill(int line_index, unsigned int addr, unsigned int tag,
     uint32_t full_addr = (this->get_line_base(addr << this->refill_shift) + this->add_offset);
 
     this->trace.msg(vp::Trace::LEVEL_DEBUG, "Refilling line (addr: 0x%x, index: %d)\n", full_addr, line_index);
+    if (!req->is_debug())
+        this->cnt_refill_cnt_++;
     // Flush the line in case it is dirty to copy it back outside
     // flush();
 
@@ -472,6 +488,9 @@ vp::IoReqStatus Cache::req(vp::Block *__this, vp::IoReq *req, int port)
     }
 
     _this->io_event[port].event((uint8_t *)&offset);
+
+    if (!req->is_debug())
+        _this->cnt_access_++;
 
     return _this->handle_req(req);
 }

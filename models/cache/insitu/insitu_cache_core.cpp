@@ -53,6 +53,14 @@ public:
                 (unsigned long)cnt_wt_noalloc_,
                 (unsigned long)lat_sum_, (unsigned long)lat_b1_, (unsigned long)lat_clamp_,
                 (unsigned long)n_clamp_, (unsigned long)lat_winfo_, (unsigned long)lat_wcommit_);
+        uint64_t hist_total = 0;
+        for (int i = 0; i < kLatBuckets; i++) hist_total += lat_hist_[i];
+        if (hist_total) {
+            fprintf(stderr, "[INSITU-HIST %s]", this->get_path().c_str());
+            for (int i = 0; i < kLatBuckets; i++)
+                fprintf(stderr, " %lu", (unsigned long)lat_hist_[i]);
+            fprintf(stderr, "\n");
+        }
         vp::Component::stop();
     }
 
@@ -226,6 +234,17 @@ private:
     // latency-budget diagnostics: requests, total stamped latency, and the per-mechanism waits
     uint64_t lat_sum_=0, lat_b1_=0, lat_clamp_=0, lat_winfo_=0, lat_wcommit_=0, n_clamp_=0;
     uint64_t cnt_flush_=0, cnt_flush_dirty_=0;
+    // Load/store latency histogram (charged full latency per completed request).
+    // Bucket 0 = latency 0; bucket i (i>=1) = [2^(i-1), 2^i). Dumped at stop() as [INSITU-HIST].
+    static constexpr int kLatBuckets = 24;
+    uint64_t lat_hist_[kLatBuckets] = {0};
+    void lat_note(vp::IoReq *req) {
+        uint64_t l = (uint64_t)req->get_full_latency();
+        lat_sum_ += l;
+        int b = l ? 64 - __builtin_clzll(l) : 0;
+        if (b >= kLatBuckets) b = kLatBuckets - 1;
+        lat_hist_[b]++;
+    }
 };
 
 InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
@@ -561,7 +580,7 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
                                        ? write_hit_latency_cycles_ : hit_latency_cycles_;
                 req->inc_latency(wl);
                 cnt_wt_noalloc_++;
-                lat_sum_ += (uint64_t)req->get_full_latency();
+                lat_note(req);
                 return vp::IO_REQ_OK;
             }
 
@@ -570,7 +589,7 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
                     memcpy(req->get_data(), sb_data_.data() + off, n);
                 req->inc_latency(hit_latency_cycles_);
                 cnt_sb_hit_++;
-                lat_sum_ += (uint64_t)req->get_full_latency();
+                lat_note(req);
                 return vp::IO_REQ_OK;
             }
 
@@ -595,7 +614,7 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
                     req->inc_latency((issue - now) + ml_nominal_);
                     sync_refill_busy_until_ = issue + ml_nominal_;
                     cnt_sb_fill_++;
-                    lat_sum_ += (uint64_t)req->get_full_latency();
+                    lat_note(req);
                     return vp::IO_REQ_OK;
                 }
             }
@@ -690,7 +709,7 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
             cnt_rd_hit_++;
             req->inc_latency(hit_latency_cycles_);
         }
-        lat_sum_ += (uint64_t)req->get_full_latency();
+        lat_note(req);
         return vp::IO_REQ_OK;
     }
 
@@ -771,7 +790,7 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
             req->inc_latency(resp_cycle - now);
         }
         cnt_refill_++;
-        lat_sum_ += (uint64_t)req->get_full_latency();
+        lat_note(req);
         return vp::IO_REQ_OK;
     }
     // The refill did not complete (rst != OK). The cluster L2 (wide_axi → SPM) answers synchronously, so
@@ -793,7 +812,7 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
     req->set_addr(req_addr_save);
     if (fst == vp::IO_REQ_OK) {
         req->inc_latency((int64_t)req->get_full_latency() + miss_penalty_cycles_);
-        lat_sum_ += (uint64_t)req->get_full_latency();
+        lat_note(req);
         return vp::IO_REQ_OK;
     }
     // Last resort (should be unreachable with a synchronous memory): keep the VLSU alive as before, but
