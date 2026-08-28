@@ -46,6 +46,17 @@ public:
                     (unsigned long)cnt_sb_fill_, (unsigned long)cnt_sb_wait_,
                     (unsigned long)cnt_pf_, (unsigned long)cnt_pf_late_,
                     (unsigned long)cnt_inval_);
+        uint64_t dtot = 0;
+        for (size_t t = 0; t < dest_rd_.size(); t++) dtot += dest_rd_[t] + dest_wr_[t];
+        if (dtot) {
+            fprintf(stderr, "[INSITU-DEST %s] tile=%u rd:", this->get_path().c_str(), tile_id_);
+            for (size_t t = 0; t < dest_rd_.size(); t++)
+                fprintf(stderr, " %lu", (unsigned long)dest_rd_[t]);
+            fprintf(stderr, " wr:");
+            for (size_t t = 0; t < dest_wr_.size(); t++)
+                fprintf(stderr, " %lu", (unsigned long)dest_wr_[t]);
+            fprintf(stderr, "\n");
+        }
         vp::Component::stop();
     }
 
@@ -83,7 +94,7 @@ private:
     enum { FILL_FAILED = -1, FILL_PENDING = -2 };
     int64_t fill_line(StreamBuf &buf, uint64_t line_addr);
     static void fill_resp(vp::Block *__this, vp::IoReq *req);
-    uint32_t route_out(uint64_t addr, uint64_t *routed_addr);
+    uint32_t route_out(uint64_t addr, uint64_t *routed_addr, uint32_t *dest_tile = nullptr);
 
     RouteGeom geom_;
     uint32_t  num_inputs_, num_outputs_, num_cache_, num_remote_port_;
@@ -98,6 +109,14 @@ private:
     StreamBuf *bufs_ = nullptr;
     uint64_t  cnt_sb_hit_ = 0, cnt_sb_fill_ = 0, cnt_sb_wait_ = 0;
     uint64_t  cnt_pf_ = 0, cnt_pf_late_ = 0, cnt_inval_ = 0;
+    // Destination histogram: demand requests from THIS tile's cores (and this tile's window
+    // line fetches), by routed destination tile — dest_rd_[t]/dest_wr_[t] = requests to tile t.
+    // Tile-local = own index; the parser folds the rest into group-local/remote for any grouping.
+    std::vector<uint64_t> dest_rd_, dest_wr_;
+    void note_dest(bool is_write, uint32_t tile) {
+        if (tile >= dest_rd_.size()) return;
+        (is_write ? dest_wr_ : dest_rd_)[tile]++;
+    }
 
     std::vector<vp::IoSlave *>  inputs_;
     std::vector<vp::IoMaster *> outputs_;
@@ -129,6 +148,8 @@ InsituCacheXbar::InsituCacheXbar(vp::ComponentConf &conf) : vp::Component(conf)
                /*dyn_offset*/cfg->get_child_int("dynamic_offset"), /*addr_w*/cfg->get_child_int("addr_width"),
                 /*priv_start*/priv_start);
     geom_.parse_regions(cfg->get_child_str("regions").c_str());
+    dest_rd_.assign(geom_.num_tiles, 0);
+    dest_wr_.assign(geom_.num_tiles, 0);
 
     num_cores_ = cfg->get_child_int("num_cores");
     {
@@ -197,9 +218,10 @@ vp::IoReqStatus InsituCacheXbar::config_handler(vp::Block *__this, vp::IoReq *re
     return vp::IO_REQ_OK;
 }
 
-uint32_t InsituCacheXbar::route_out(uint64_t addr, uint64_t *routed_addr)
+uint32_t InsituCacheXbar::route_out(uint64_t addr, uint64_t *routed_addr, uint32_t *dest_tile)
 {
     ReqRoute r = geom_.route_request(addr, tile_id_, num_private_cache_);
+    if (dest_tile) *dest_tile = r.local ? tile_id_ : r.remote_tile;
     uint32_t out_id = r.sel;
     if (out_id >= num_outputs_) out_id = num_outputs_ - 1;   // safety clamp
     *routed_addr = addr;
@@ -219,12 +241,14 @@ int64_t InsituCacheXbar::fill_line(StreamBuf &buf, uint64_t line_addr)
 {
     if (buf.filling) return FILL_FAILED;   // one in flight per buffer
     uint64_t routed = line_addr;
-    const uint32_t out_id = route_out(line_addr, &routed);
+    uint32_t dest_tile = 0;
+    const uint32_t out_id = route_out(line_addr, &routed, &dest_tile);
     buf.fill_req.init();
     buf.fill_req.set_addr(routed);
     buf.fill_req.set_size(line_bytes_);
     buf.fill_req.set_is_write(false);
     buf.fill_req.set_data(buf.data.data());
+    note_dest(false, dest_tile);
     const vp::IoReqStatus st = outputs_[out_id]->req(&buf.fill_req);
     if (st == vp::IO_REQ_OK) return (int64_t)buf.fill_req.get_full_latency();
     if (st == vp::IO_REQ_PENDING) {
@@ -347,7 +371,11 @@ vp::IoReqStatus InsituCacheXbar::req_handler(vp::Block *__this, vp::IoReq *req, 
     }
 
     uint64_t routed = addr;
-    const uint32_t out_id = _this->route_out(addr, &routed);
+    uint32_t dest_tile = 0;
+    const uint32_t out_id = _this->route_out(addr, &routed, &dest_tile);
+
+    if ((uint32_t)input_id < _this->num_cores_ && !req->is_debug())
+        _this->note_dest(req->get_is_write(), dest_tile);
 
     if (_this->forward_initiator_) req->set_initiator(input_id);
     if (_this->xbar_latency_cycles_ > 0) req->inc_latency(_this->xbar_latency_cycles_);
