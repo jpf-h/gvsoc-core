@@ -19,6 +19,7 @@
  * Authors: Germain Haugou, GreenWaves Technologies (germain.haugou@greenwaves-technologies.com)
  */
 
+#include "cpu/iss/include/pcstat.hpp"
 #include "cpu/iss/include/iss.hpp"
 #include <string.h>
 #include <cstdio>
@@ -147,6 +148,9 @@ void IssWrapper::start()
 
 void IssWrapper::stop()
 {
+    // Per-PC load/store attribution (CACHEPOOL_PC_STATS): dump the process-wide table once,
+    // from stop() — the reliable end-of-sim hook (atexit is skipped on the engine's exit path).
+    pcstat::Registry::get().dump_at_stop();
 #if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
     this->iss.vu.dump_stats();
 #endif

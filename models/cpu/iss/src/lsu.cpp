@@ -21,6 +21,7 @@
 
 #include <vp/vp.hpp>
 #include "cpu/iss/include/iss.hpp"
+#include "cpu/iss/include/pcstat.hpp"
 #include "vp/signal.hpp"
 
 void Lsu::reset(bool active)
@@ -143,6 +144,14 @@ void Lsu::data_response(vp::Block *__this, vp::IoReq *req)
 #ifdef CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING
     _this->pending_latency = 0;
     int req_id = *((int *)req->arg_get(0));
+    if (pcstat::Registry::get().enabled())
+    {
+        const int64_t lat = _this->iss.top.clock.get_cycles() - _this->pcstat_cycle[req_id];
+        pcstat::Registry::get().note((uint32_t)_this->pcstat_pc[req_id], req->get_is_write(),
+            _this->pcstat_amo[req_id], req->get_addr(),
+            (uint32_t)_this->iss.csr.mhartid / _this->pcstat_cores_per_tile(),
+            (uint64_t)(lat > 0 ? lat : 0));
+    }
     // Call the access termination callback only we the access is not misaligned since
     // in this case, the second access with handle it.
     if (_this->misaligned_size == 0)
@@ -193,6 +202,13 @@ int Lsu::data_req_aligned(iss_addr_t addr, uint8_t *data_ptr, uint8_t *memcheck_
     req->set_size(size);
     req->set_is_write(is_write);
 #ifdef CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING
+    if (pcstat::Registry::get().enabled())
+    {
+        const int pcstat_rid = *((int *)req->arg_get(0));
+        this->pcstat_pc[pcstat_rid] = this->iss.exec.current_insn;
+        this->pcstat_cycle[pcstat_rid] = this->iss.top.clock.get_cycles();
+        this->pcstat_amo[pcstat_rid] = false;
+    }
     if (is_write)
     {
         // Since accesses are not blocking and the store may use input data later, we need
@@ -243,6 +259,11 @@ int Lsu::data_req_aligned(iss_addr_t addr, uint8_t *data_ptr, uint8_t *memcheck_
         this->free_req(req, this->iss.top.clock.get_cycles() + latency);
     #endif
 
+        if (pcstat::Registry::get().enabled())
+        {
+            pcstat::Registry::get().note((uint32_t)this->iss.exec.current_insn, is_write, false,
+                addr, (uint32_t)this->iss.csr.mhartid / pcstat_cores_per_tile(), (uint64_t)latency);
+        }
 
         return 0;
     }
@@ -549,6 +570,15 @@ bool Lsu::atomic(iss_insn_t *insn, iss_addr_t addr, int size, int reg_in, int re
     req->set_size(size);
     req->set_opcode(opcode);
 #ifdef CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING
+    if (pcstat::Registry::get().enabled())
+    {
+        const int pcstat_rid = *((int *)req->arg_get(0));
+        this->pcstat_pc[pcstat_rid] = insn->addr;
+        this->pcstat_cycle[pcstat_rid] = this->iss.top.clock.get_cycles();
+        this->pcstat_amo[pcstat_rid] = true;
+    }
+#endif
+#ifdef CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING
     // Since accesses are not blocking and the store may use input data later, we need
     // to save it to the request
     uint8_t *req_data = (uint8_t *)&this->req_data[*((int *)req->arg_get(0))];
@@ -593,6 +623,12 @@ bool Lsu::atomic(iss_insn_t *insn, iss_addr_t addr, int size, int reg_in, int re
         // For synchronous requests, free the request now with the proper latency, so that
         // it becomes available only after the latency has ellapsed
         this->free_req(req, this->iss.top.clock.get_cycles() + req->get_latency());
+        if (pcstat::Registry::get().enabled())
+        {
+            pcstat::Registry::get().note((uint32_t)insn->addr, true, true, phys_addr,
+                (uint32_t)this->iss.csr.mhartid / pcstat_cores_per_tile(),
+                (uint64_t)req->get_latency());
+        }
 #ifdef CONFIG_GVSOC_ISS_SCOREBOARD
         // ...and mark the destination register pending for the same window (stall-on-use).
         // Without this a sync-OK AMO completes instantly and a result-consuming spin loop

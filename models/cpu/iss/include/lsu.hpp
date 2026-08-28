@@ -23,6 +23,7 @@
 
 #include <cpu/iss/include/types.hpp>
 #include <vp/signal.hpp>
+#include <cstdlib>
 
 #ifndef CONFIG_GVSOC_ISS_SNITCH
 #define ADDR_MASK (~(ISS_REG_WIDTH / 8 - 1))
@@ -92,6 +93,17 @@ public:
 
     inline void stack_access_check(int reg, iss_addr_t addr);
 
+    // CACHEPOOL_CORES_PER_TILE, read once — mhartid / this = the core's tile id (pcstat).
+    inline uint32_t pcstat_cores_per_tile() {
+        static uint32_t v = 0;
+        if (v == 0) {
+            const char *e = getenv("CACHEPOOL_CORES_PER_TILE");
+            v = (e && e[0]) ? (uint32_t)strtoul(e, nullptr, 0) : 4;
+            if (v == 0) v = 4;
+        }
+        return v;
+    }
+
     // Allocate a request. This can returns NULL if the core can not send more requests (last one
     // was denied or all requests are already allocated). In this case the core should stall.
     inline vp::IoReq *get_req();
@@ -117,6 +129,12 @@ public:
     // List of requests which can be sent at the same time.
     vp::IoReq io_req[CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING];
     iss_reg_t stall_insn[CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING];
+    // Per-PC attribution (CACHEPOOL_PC_STATS, cpu/iss/include/pcstat.hpp): issuing PC and
+    // issue cycle of each outstanding request, so an asynchronous completion can be
+    // attributed in data_response(). Written only when the registry is enabled.
+    iss_reg_t pcstat_pc[CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING];
+    int64_t pcstat_cycle[CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING];
+    bool pcstat_amo[CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING];
     iss_reg_t req_data[CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING];
 #else
     vp::IoReq io_req;
