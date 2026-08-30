@@ -8,6 +8,13 @@
 // (cache/insitu/insitu_cache_route.hpp), configured from the same CACHEPOOL_* environment
 // the target reads — so it can never disagree with where the request actually went.
 //
+// WINDOWING (CACHEPOOL_PC_STATS_CTRL=0x<addr>): with a control word configured,
+// attribution starts PAUSED and the target drives it by storing to that word —
+// 1 = resume, 0 = pause, 2 = reset (drop everything accumulated so far). The
+// kernel brackets its data-processing phase with it, so boot, .bss zeroing,
+// scenario precompute and per-interval bench bookkeeping stay out of the
+// profile entirely. Unset, everything is attributed from reset (old behavior).
+//
 // Process-global, merged across cores on the fly (GVSoC single-thread engine; a mutex keeps
 // multi-thread runs safe), dumped once at process exit to stderr:
 //   [PC-STATS] pc=%08x n= w= a= lat= max= t= g= r= x=
@@ -40,6 +47,19 @@ public:
         return inst;
     }
     bool enabled() const { return enabled_; }
+    bool active() const { return active_; }
+    uint32_t ctrl_addr() const { return ctrl_addr_; }
+
+    /// Target-driven window control (store to the configured control word).
+    void control(uint32_t value) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        switch (value) {
+            case 0: if (active_) { active_ = false; windows_++; } break;
+            case 1: active_ = true; break;
+            case 2: map_.clear(); windows_ = 0; break;   // reset
+            default: break;
+        }
+    }
 
     // CACHEPOOL_PC_STATS_CORE=N (or "N,M,..."): attribute only these harts, so one
     // core's profile is not drowned by 255 others (a team leader, the UE core, ...).
@@ -55,6 +75,7 @@ public:
             const uint32_t dest = r.local ? my_tile : r.remote_tile;
             cls = (dest == my_tile) ? 0 : (dest / tiles_per_group_ == my_tile / tiles_per_group_) ? 1 : 2;
         }
+        if (!active_) return;
         std::lock_guard<std::mutex> lock(mutex_);
         Stat &s = map_[pc];
         s.n++;
@@ -86,6 +107,11 @@ private:
                    /*n_tiles*/nb_tile, /*dyn_offset*/6, /*addr_w*/32, /*priv_start*/0);
         const char *regions = getenv("CACHEPOOL_L1_REGIONS");
         if (regions != nullptr) geom_.parse_regions(regions);
+        if (const char *cc = getenv("CACHEPOOL_PC_STATS_CTRL")) {
+            ctrl_addr_ = (uint32_t)envu("CACHEPOOL_PC_STATS_CTRL", 0);
+            if (ctrl_addr_ != 0) active_ = false;   // windowed: the target opens the window
+            (void)cc;
+        }
         if (const char *cf = getenv("CACHEPOOL_PC_STATS_CORE")) {
             for (const char *p = cf; *p; ) {
                 char *end = nullptr;
@@ -110,8 +136,10 @@ public:
 
         uint64_t tot_n = 0, tot_lat = 0;
         for (const auto &kv : map_) { tot_n += kv.second.n; tot_lat += kv.second.lat; }
-        fprintf(stderr, "[PC-STATS-TOTAL] pcs=%zu n=%llu lat=%llu\n",
-                map_.size(), (unsigned long long)tot_n, (unsigned long long)tot_lat);
+        fprintf(stderr, "[PC-STATS-TOTAL] pcs=%zu n=%llu lat=%llu windows=%llu%s\n",
+                map_.size(), (unsigned long long)tot_n, (unsigned long long)tot_lat,
+                (unsigned long long)windows_,
+                ctrl_addr_ ? " (windowed: data-processing phases only)" : "");
         for (const auto &kv : map_) {
             const Stat &s = kv.second;
             fprintf(stderr,
@@ -127,6 +155,9 @@ public:
 private:
     bool enabled_ = false;
     bool dumped_ = false;
+    bool active_ = true;         // windowed runs start paused (see ctrl_addr_)
+    uint32_t ctrl_addr_ = 0;
+    uint64_t windows_ = 0;
     bool core_filter_ = false;
     std::set<uint32_t> sel_;
     uint32_t cores_per_tile_ = 4, tiles_per_group_ = 16;

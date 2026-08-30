@@ -191,6 +191,20 @@ int Lsu::data_req_aligned(iss_addr_t addr, uint8_t *data_ptr, uint8_t *memcheck_
             this->iss.syscalls.htif.notify_tohost_store();
         }
     }
+    // PC-stats window control: a store to the configured control word opens/closes
+    // the attribution window (1 resume, 0 pause, 2 reset). The store itself proceeds
+    // into memory unchanged — the word is an ordinary target global.
+    if (is_write && data_ptr != nullptr)
+    {
+        const uint32_t sc = pcstat::Registry::get().ctrl_addr();
+        if (__builtin_expect(sc != 0 && (uint32_t)addr == sc, 0))
+        {
+            uint32_t v = 0;
+            memcpy(&v, data_ptr, size < 4 ? size : 4);
+            pcstat::Registry::get().control(v);
+        }
+    }
+
     this->trace.msg("Data request (addr: 0x%lx, size: 0x%x, is_write: %d)\n", addr, size, is_write);
     vp::IoReq *req = this->get_req();
     if (req == NULL)
