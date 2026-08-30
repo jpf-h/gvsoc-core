@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 
 #include "cache/insitu/insitu_cache_route.hpp"
@@ -39,6 +40,12 @@ public:
         return inst;
     }
     bool enabled() const { return enabled_; }
+
+    // CACHEPOOL_PC_STATS_CORE=N (or "N,M,..."): attribute only these harts, so one
+    // core's profile is not drowned by 255 others (a team leader, the UE core, ...).
+    inline bool core_selected(uint32_t hart) const {
+        return !core_filter_ || sel_.count(hart) != 0;
+    }
 
     void note(uint32_t pc, bool is_write, bool is_amo, uint64_t addr, uint32_t my_tile,
               uint64_t latency) {
@@ -79,6 +86,16 @@ private:
                    /*n_tiles*/nb_tile, /*dyn_offset*/6, /*addr_w*/32, /*priv_start*/0);
         const char *regions = getenv("CACHEPOOL_L1_REGIONS");
         if (regions != nullptr) geom_.parse_regions(regions);
+        if (const char *cf = getenv("CACHEPOOL_PC_STATS_CORE")) {
+            for (const char *p = cf; *p; ) {
+                char *end = nullptr;
+                const unsigned long v = strtoul(p, &end, 0);
+                if (end == p) break;
+                sel_.insert((uint32_t)v);
+                p = (*end == ',') ? end + 1 : end;
+            }
+            core_filter_ = !sel_.empty();
+        }
     }
 
 public:
@@ -110,6 +127,8 @@ public:
 private:
     bool enabled_ = false;
     bool dumped_ = false;
+    bool core_filter_ = false;
+    std::set<uint32_t> sel_;
     uint32_t cores_per_tile_ = 4, tiles_per_group_ = 16;
     uint64_t cached_base_ = 0x80000000ull, cached_size_ = 0x20000000ull;
     insitu::RouteGeom geom_;
