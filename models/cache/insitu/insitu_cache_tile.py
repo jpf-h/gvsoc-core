@@ -210,7 +210,7 @@ class InsituCacheTile(Component):
                 enable_rotation=en_rot,
                 private_start_addr=_priv_start,
                 regions=getattr(config, 'regions', ''),
-                noalloc=getattr(config, 'noalloc', ''),
+                hint_base=getattr(config, 'hint_base', 0),
                 line_bytes=getattr(config.controller, 'cache_line_bytes', 64)))
 
         use_coal = getattr(config, 'cell_coalescer', False)
@@ -229,8 +229,7 @@ class InsituCacheTile(Component):
                 rotate_addr_width=config.addr_width,
                 # E3: this bank's identity for runtime repartition (default matches the xbar).
                 bank_index=cb, num_cache=n_ctrl, num_tiles=config.num_tiles,
-                num_private_cache=n_priv,
-                noalloc=getattr(config, 'noalloc', '')))
+                num_private_cache=n_priv))
             if use_coal:
                 # C1: coalesce on the 16 B part (production folds PartSplit=4 → CoalescerDataWidth =
                 # CacheLineWidth/4 = 128b, cachepool_cache_ctrl.sv:80-81), not the 64 B line.

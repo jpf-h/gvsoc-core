@@ -31,8 +31,7 @@ class InsituCacheCore(Component):
                  config: InsituCacheControllerConfig | None = None,
                  num_input_ports: int = 1,
                  rotate_bits: int = 0, rotate_dyn_offset: int = 0, rotate_addr_width: int = 32,
-                 bank_index: int = 0, num_cache: int = 1, num_tiles: int = 1, num_private_cache: int = 0,
-                 noalloc: str = ''):
+                 bank_index: int = 0, num_cache: int = 1, num_tiles: int = 1, num_private_cache: int = 0):
         if config is None:
             config = InsituCacheControllerConfig()
 
@@ -81,9 +80,6 @@ class InsituCacheCore(Component):
             'num_tiles': num_tiles,
             'num_private_cache': num_private_cache,
             # No-allocate window "base:size" over GLOBAL addresses (rlc_am doc/RLC_HW.md §2):
-            # reads inside it are served through a single-line stream buffer without allocating
-            # a way, writes go write-through only. Empty = disabled.
-            'noalloc': noalloc,
         })
 
     def i_INPUT(self, port: int = 0) -> SlaveItf:

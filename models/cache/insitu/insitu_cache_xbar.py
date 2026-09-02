@@ -30,7 +30,7 @@ class InsituCacheXbar(Component):
                  dynamic_offset: int = 6, addr_width: int = 32, private_start_addr: int = 0,
                  xbar_latency_cycles: int = 0, enable_rotation: bool = False,
                  forward_initiator: bool = False, regions: str = '',
-                 noalloc: str = '', line_bytes: int = 64):
+                 hint_base: int = 0, line_bytes: int = 64):
         super().__init__(parent, name)
 
         self.add_sources(['cache/insitu/insitu_cache_xbar.cpp'])
@@ -62,9 +62,10 @@ class InsituCacheXbar(Component):
             # flat routing everywhere (today's behavior).
             'regions': regions,
             # No-allocate window "base:size[:pf_port]" — requester-side per-core-port stream
-            # buffers for window reads, and the optional posted-prefetch port word
-            # (drivers/hint.h, doc/RLC_HW.md §2). Empty = no buffers (today's behavior).
-            'noalloc': noalloc,
+            # Fixed hint-register page (drivers/hint.h, doc/RLC_HW.md §2/§4b): +0 is the
+            # prefetch register. 0 = no page; the per-core line buffers exist regardless,
+            # driven by the address alias bit alone.
+            'hint_base': hint_base,
             'line_bytes': line_bytes,
         })
 

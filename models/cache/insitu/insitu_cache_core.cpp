@@ -168,7 +168,6 @@ private:
     // whose GLOBAL (unrotated) address falls in [base, base+size) never allocate a way. Reads
     // are served from a single-line stream buffer, refilled from L2 without installing; writes
     // go write-through only. 0 size = disabled (default, behavior identical).
-    uint64_t noalloc_base_ = 0, noalloc_size_ = 0;
     uint64_t sb_line_ = ~0ull;             // global line address held by the stream buffer
     std::vector<uint8_t> sb_data_;
     vp::IoReq sb_req_;
@@ -298,15 +297,6 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
     num_tiles_        = cfg->get_child_int("num_tiles");
     num_private_cache_= cfg->get_child_int("num_private_cache");
 
-    // No-allocate window "base:size" (rlc_am doc/RLC_HW.md §2); empty = disabled.
-    {
-        const std::string na = cfg->get_child_str("noalloc");
-        unsigned long long b = 0, s = 0;
-        if (sscanf(na.c_str(), "%lli:%lli", (long long *)&b, (long long *)&s) == 2) {
-            noalloc_base_ = b;
-            noalloc_size_ = s;
-        }
-    }
     sb_data_.assign(cache_line_bytes_, 0);
 
     geom_.init(cache_line_bytes_, num_ways_, num_sets_, cfg->get_child_bool("use_hash_way_select"), false);
@@ -556,18 +546,20 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
 
     Decode d = decode_request(geom_, ways, addr, is_write);
 
-    // --- NO-ALLOCATE WINDOW (rlc_am doc/RLC_HW.md §2) --- an access whose GLOBAL address falls
-    // in the window never allocates a way. Payload and received-transport-block bytes stay out
-    // of the cache entirely: a read misses into the single-line stream buffer (refilled from L2
-    // through the same serialized refill gate, but with NO install and NO victim), and a write
-    // goes write-through only. A line the cache happens to hold VALID falls through to the
-    // ordinary hit paths — nothing in the window can *become* valid, so that is only a
-    // pre-window relic draining out. The stream buffer is invalidated by a window write to its
-    // line; the kernel's contract (bytes stable for the duration of the parse, dropped at every
-    // fence in real hardware) makes that sufficient.
-    if (noalloc_size_ != 0 && !d.is_hit) {
+    // --- NO-ALLOCATE ACCESS (rlc_am doc/RLC_HW.md §2) --- a request carrying the no-allocate
+    // attribute (IoReq::noalloc — set where the platform's encoding of the hint is decoded, for
+    // cachepool the tile xbar stripping the address alias bit) never allocates a way. Payload
+    // and received-transport-block bytes stay out of the cache entirely: a read misses into the
+    // single-line stream buffer (refilled from L2 through the same serialized refill gate, but
+    // with NO install and NO victim), and a write goes write-through only. A line the cache
+    // happens to hold VALID falls through to the ordinary hit paths — allocating accesses to
+    // the same bytes can exist (the mixed sharing case), and a hit is a hit. The stream buffer
+    // is invalidated by a no-allocate write to its line; the kernel's contract (bytes stable
+    // for the duration of the parse, dropped at every fence in real hardware) makes that
+    // sufficient.
+    if (req->is_noalloc() && !d.is_hit) {
         const uint64_t gaddr = l2_addr(addr);
-        if ((gaddr - noalloc_base_) < noalloc_size_) {
+        {
             const uint64_t gline = gaddr & ~((uint64_t)cache_line_bytes_ - 1);
             const uint32_t off = (uint32_t)(gaddr & (cache_line_bytes_ - 1));
             uint32_t n = (uint32_t)req->get_size();

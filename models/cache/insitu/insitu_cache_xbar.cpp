@@ -40,12 +40,13 @@ class InsituCacheXbar : public vp::Component
 public:
     explicit InsituCacheXbar(vp::ComponentConf &conf);
     void stop() override {
-        if (na_size_ != 0 && (cnt_sb_hit_ | cnt_sb_fill_ | cnt_pf_))
-            fprintf(stderr, "[INSITU-XBAR %s] sb_hit=%lu sb_fill=%lu sb_wait_sum=%lu pf=%lu pf_late=%lu inval=%lu\n",
+        if (cnt_sb_hit_ | cnt_sb_fill_ | cnt_pf_ | cnt_touch_)
+            fprintf(stderr, "[INSITU-XBAR %s] sb_hit=%lu sb_fill=%lu sb_wait_sum=%lu pf=%lu pf_late=%lu inval=%lu touch=%lu touch_drop=%lu\n",
                     this->get_path().c_str(), (unsigned long)cnt_sb_hit_,
                     (unsigned long)cnt_sb_fill_, (unsigned long)cnt_sb_wait_,
                     (unsigned long)cnt_pf_, (unsigned long)cnt_pf_late_,
-                    (unsigned long)cnt_inval_);
+                    (unsigned long)cnt_inval_, (unsigned long)cnt_touch_,
+                    (unsigned long)cnt_touch_drop_);
         uint64_t dtot = 0;
         for (size_t t = 0; t < dest_rd_.size(); t++) dtot += dest_rd_[t] + dest_wr_[t];
         if (dtot) {
@@ -69,14 +70,18 @@ private:
     // One line buffer per LOCAL core port of this lane, at the requesting tile — where
     // drivers/hint.h places it — rather than at the home bank, where every requester
     // (the DMA engine's payload stream included) shared one line and evicted each other.
-    // A read in the no-allocate window is served from the port's buffer when it holds the
-    // line; a miss fetches the line ONCE through the normal routed path (the home bank
-    // refills from L2 without installing) and keeps it. A posted prefetch — a store of the
-    // target address to the configured port word — starts that fetch without blocking the
-    // core; the fill's cost is modeled as buffer readiness (`ready_cycle`), so a demand
-    // read arriving early pays only the residue. Window writes from this tile invalidate
-    // matching lines in every local buffer; cross-tile writes are invisible by design —
-    // hint.h's contract demands the bytes be stable for the duration of the read.
+    // The no-allocate attribute is PER ACCESS, not a window: software reads through the
+    // address alias (`insitu::noalloc_alias_bit`); this xbar strips the bit at ingress and
+    // carries the attribute onward as IoReq::noalloc. A no-allocate read is served from the
+    // port's buffer when it holds the line; a miss fetches the line ONCE through the normal
+    // routed path (the home bank refills from L2 without installing) and keeps it. A posted
+    // prefetch — a store of the target address to the fixed hint register (hint_base_+0) —
+    // starts that fetch without blocking the core when the stored value carries the alias
+    // bit, or posts an ordinary ALLOCATING line touch when it does not; either way the
+    // fill's cost is modeled as buffer readiness (`ready_cycle`) or dropped when the slot
+    // is busy — a hint is droppable. No-allocate writes from this tile invalidate matching
+    // lines in every local buffer; cross-tile writes are invisible by design — hint.h's
+    // contract demands the bytes be stable for the duration of the read.
     struct StreamBuf {
         uint64_t line = ~0ull;
         int64_t  ready_cycle = 0;
@@ -94,6 +99,15 @@ private:
     enum { FILL_FAILED = -1, FILL_PENDING = -2 };
     int64_t fill_line(StreamBuf &buf, uint64_t line_addr);
     static void fill_resp(vp::Block *__this, vp::IoReq *req);
+
+    // A posted ALLOCATING line touch (rlc_am doc/RLC_HW.md §4): the home bank installs the
+    // line; the response data is discarded here. One in flight per core port; a hint that
+    // finds the slot busy is dropped (counted) — hints carry no completion contract.
+    struct TouchSlot {
+        vp::IoReq req;
+        std::vector<uint8_t> data;
+        bool busy = false;
+    };
     uint32_t route_out(uint64_t addr, uint64_t *routed_addr, uint32_t *dest_tile = nullptr);
 
     RouteGeom geom_;
@@ -104,11 +118,13 @@ private:
     bool      enable_rotation_;
     bool      forward_initiator_;
 
-    uint64_t  na_base_ = 0, na_size_ = 0, pf_addr_ = 0;
+    uint64_t  hint_base_ = 0;   // fixed hint-register page (0 = none); +0 = prefetch register
     uint32_t  line_bytes_ = 64;
     StreamBuf *bufs_ = nullptr;
+    TouchSlot *touches_ = nullptr;
     uint64_t  cnt_sb_hit_ = 0, cnt_sb_fill_ = 0, cnt_sb_wait_ = 0;
     uint64_t  cnt_pf_ = 0, cnt_pf_late_ = 0, cnt_inval_ = 0;
+    uint64_t  cnt_touch_ = 0, cnt_touch_drop_ = 0;
     // Destination histogram: demand requests from THIS tile's cores (and this tile's window
     // line fetches), by routed destination tile — dest_rd_[t]/dest_wr_[t] = requests to tile t.
     // Tile-local = own index; the parser folds the rest into group-local/remote for any grouping.
@@ -155,16 +171,19 @@ InsituCacheXbar::InsituCacheXbar(vp::ComponentConf &conf) : vp::Component(conf)
     {
         const int lb = cfg->get_child_int("line_bytes");
         line_bytes_ = (lb > 0) ? (uint32_t)lb : 64u;
-        const std::string na = cfg->get_child_str("noalloc");
-        unsigned long b = 0, s = 0, p = 0;
-        if (!na.empty() && sscanf(na.c_str(), "%lx:%lx:%lx", &b, &s, &p) >= 2) {
-            na_base_ = b;
-            na_size_ = s;
-            pf_addr_ = p;   // 0 when the third field is absent: no prefetch port.
-        }
-        if (na_size_ != 0) {
-            bufs_ = new StreamBuf[num_cores_];
-            for (uint32_t c = 0; c < num_cores_; ++c) bufs_[c].data.assign(line_bytes_, 0);
+        // Fixed hint-register page (like every other peripheral): +0 is the prefetch
+        // register. 0 disables the page; the line buffers exist regardless — the alias
+        // bit alone is enough to use them. Read through the 64-bit path: the page sits
+        // at 0xC004_0000 > INT32_MAX, and get_child_int narrows to `int` and sign-extends
+        // (0xFFFFFFFFC0040000), so the page compare would never match (same trap the
+        // private_start_addr read above documents).
+        hint_base_ = cfg->get("hint_base")
+            ? (uint64_t)cfg->get("hint_base")->get_int() : 0;
+        bufs_    = new StreamBuf[num_cores_];
+        touches_ = new TouchSlot[num_cores_];
+        for (uint32_t c = 0; c < num_cores_; ++c) {
+            bufs_[c].data.assign(line_bytes_, 0);
+            touches_[c].data.assign(line_bytes_, 0);
         }
     }
 
@@ -248,6 +267,7 @@ int64_t InsituCacheXbar::fill_line(StreamBuf &buf, uint64_t line_addr)
     buf.fill_req.set_size(line_bytes_);
     buf.fill_req.set_is_write(false);
     buf.fill_req.set_data(buf.data.data());
+    buf.fill_req.set_noalloc(true);   // the home bank serves it from L2 without installing
     note_dest(false, dest_tile);
     const vp::IoReqStatus st = outputs_[out_id]->req(&buf.fill_req);
     if (st == vp::IO_REQ_OK) return (int64_t)buf.fill_req.get_full_latency();
@@ -264,6 +284,10 @@ int64_t InsituCacheXbar::fill_line(StreamBuf &buf, uint64_t line_addr)
 void InsituCacheXbar::fill_resp(vp::Block *__this, vp::IoReq *req)
 {
     InsituCacheXbar *_this = static_cast<InsituCacheXbar *>(__this);
+    for (uint32_t c = 0; c < _this->num_cores_; ++c) {
+        TouchSlot &touch = _this->touches_[c];
+        if (&touch.req == req) { touch.busy = false; return; }   // allocating touch: data discarded
+    }
     for (uint32_t c = 0; c < _this->num_cores_; ++c) {
         StreamBuf &buf = _this->bufs_[c];
         if (&buf.fill_req != req) continue;
@@ -287,37 +311,84 @@ void InsituCacheXbar::fill_resp(vp::Block *__this, vp::IoReq *req)
 vp::IoReqStatus InsituCacheXbar::req_handler(vp::Block *__this, vp::IoReq *req, int input_id)
 {
     InsituCacheXbar *_this = static_cast<InsituCacheXbar *>(__this);
-    const uint64_t addr = req->get_addr();
+    uint64_t addr = req->get_addr();
 
-    if (_this->na_size_ != 0 && (uint32_t)input_id < _this->num_cores_) {
-        // Posted prefetch: a store of the target address to the port word. Never forwarded —
-        // the word exists only to carry the hint. The fill runs through the normal path now
-        // (consuming real refill bandwidth at the home bank) but its cost becomes buffer
-        // readiness rather than core stall: the store returns immediately.
-        if (_this->pf_addr_ != 0 && addr == _this->pf_addr_ && req->get_is_write()) {
-            uint32_t target = 0;
-            if (req->get_data() != nullptr && req->get_size() >= 4)
-                memcpy(&target, req->get_data(), 4);
-            if (target != 0 && (uint64_t)target - _this->na_base_ < _this->na_size_) {
-                StreamBuf &buf = _this->bufs_[input_id];
-                const uint64_t line = (uint64_t)target & ~((uint64_t)_this->line_bytes_ - 1);
-                if (buf.line != line) {
-                    const int64_t lat = _this->fill_line(buf, line);
-                    if (lat >= 0) {
-                        buf.line = line;
-                        buf.ready_cycle = _this->clock.get_cycles() + lat;
+    if ((uint32_t)input_id < _this->num_cores_) {
+        // Fixed hint-register page. +0 is the prefetch register: a store of the target
+        // address posts a line fetch and returns immediately — never forwarded, the word
+        // exists only to carry the hint. A target carrying the alias bit fills this port's
+        // line buffer (the home bank serves it without installing); a plain target posts an
+        // ordinary ALLOCATING touch whose response is discarded. The fill consumes real
+        // refill bandwidth at the home bank, but its cost becomes buffer readiness rather
+        // than core stall. Every other access to the page is swallowed (reads return 0) —
+        // the sibling word +8 is the pc-stats control, intercepted at the ISS LSU, whose
+        // store still travels here and must land somewhere harmless.
+        if (_this->hint_base_ != 0 && (addr & ~0xFFFull) == _this->hint_base_) {
+            if ((addr & 0xFFFu) == 0x10 && req->get_is_write()) {
+                // rlc_nt_invalidate (doc/RLC_HW.md §2): explicitly drop the calling core's
+                // line buffer — the model hook for what any fence does in real hardware.
+                // Same drop a no-allocate write performs; an in-flight fill is handled by
+                // fill_resp (the buffer stays invalid, a parked waiter is still answered).
+                _this->bufs_[input_id].line = ~0ull;
+                req->inc_latency(1);
+                return vp::IO_REQ_OK;
+            }
+            if ((addr & 0xFFFu) == 0 && req->get_is_write()) {
+                uint32_t target = 0;
+                if (req->get_data() != nullptr && req->get_size() >= 4)
+                    memcpy(&target, req->get_data(), 4);
+                if (target & (uint32_t)noalloc_alias_bit) {
+                    StreamBuf &buf = _this->bufs_[input_id];
+                    const uint64_t taddr = (uint64_t)target & ~noalloc_alias_bit;
+                    const uint64_t line = taddr & ~((uint64_t)_this->line_bytes_ - 1);
+                    if (buf.line != line) {
+                        const int64_t lat = _this->fill_line(buf, line);
+                        if (lat >= 0) {
+                            buf.line = line;
+                            buf.ready_cycle = _this->clock.get_cycles() + lat;
+                        }
+                        if (lat != FILL_FAILED) _this->cnt_pf_++;
                     }
-                    if (lat != FILL_FAILED) _this->cnt_pf_++;
+                } else if (target != 0) {
+                    TouchSlot &touch = _this->touches_[input_id];
+                    if (touch.busy) {
+                        _this->cnt_touch_drop_++;   // droppable: a hint carries no contract
+                    } else {
+                        const uint64_t line = (uint64_t)target & ~((uint64_t)_this->line_bytes_ - 1);
+                        uint64_t routed = line;
+                        uint32_t dest_tile = 0;
+                        const uint32_t out_id = _this->route_out(line, &routed, &dest_tile);
+                        touch.req.init();
+                        touch.req.set_addr(routed);
+                        touch.req.set_size(_this->line_bytes_);
+                        touch.req.set_is_write(false);
+                        touch.req.set_data(touch.data.data());
+                        _this->note_dest(false, dest_tile);
+                        const vp::IoReqStatus st = _this->outputs_[out_id]->req(&touch.req);
+                        if (st == vp::IO_REQ_PENDING) touch.busy = true;
+                        if (st != vp::IO_REQ_DENIED) _this->cnt_touch_++;
+                    }
                 }
             }
+            if (!req->get_is_write() && req->get_data() != nullptr)
+                memset(req->get_data(), 0, req->get_size());   // hint words read as zero
             req->inc_latency(1);
             return vp::IO_REQ_OK;
         }
 
-        if (addr - _this->na_base_ < _this->na_size_) {
+        // The address-borne no-allocate permission bit (doc/RLC_HW.md §2): strip it at the
+        // first cache component and carry the attribute as IoReq::noalloc from here on —
+        // routing, MSB rotation and the bank's tags never see the bit.
+        if (addr & noalloc_alias_bit) {
+            addr &= ~noalloc_alias_bit;
+            req->set_addr(addr);
+            req->set_noalloc(true);
+        }
+
+        if (req->is_noalloc()) {
             if (req->get_is_write()) {
-                // Same-tile window write: drop every local buffer holding the line, then fall
-                // through to the ordinary path (the bank writes through without allocating).
+                // Same-tile no-allocate write: drop every local buffer holding the line, then
+                // fall through to the ordinary path (the bank writes through without allocating).
                 const uint64_t line = addr & ~((uint64_t)_this->line_bytes_ - 1);
                 for (uint32_t c = 0; c < _this->num_cores_; ++c) {
                     StreamBuf &buf = _this->bufs_[c];

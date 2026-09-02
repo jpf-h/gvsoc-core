@@ -39,6 +39,16 @@
 
 namespace insitu {
 
+// No-allocate alias bit (ManyRVData rlc_am doc/RLC_HW.md §2): the per-access permission bit is
+// address-borne on the CORE side — software reads payload through `addr | (1<<30)`, an alias of
+// the DRAM PMA ([0x8000_0000, 0xA000_0000) aliases at [0xC000_0000, 0xE000_0000), disjoint from
+// every real mapping above 0xC003_0000 for the addresses the kernel actually aliases). The tile
+// xbar STRIPS the bit at its ingress and carries the attribute as IoReq::noalloc from there on —
+// the model's stand-in for the RTL's sideband wire, required because the MSB rotation owns the
+// top address bits between xbar and bank. Consumers outside the datapath (pcstat attribution)
+// mask it with this constant.
+inline constexpr uint64_t noalloc_alias_bit = 1ull << 30;
+
 // Routed request: which xbar output, and (if remote) the target tile.
 struct ReqRoute {
     bool     local       = true;   // stays on local banks (vs forwarded to a remote tile)

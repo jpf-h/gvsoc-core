@@ -69,6 +69,7 @@ public:
 
     void note(uint32_t pc, bool is_write, bool is_amo, uint64_t addr, uint32_t my_tile,
               uint64_t latency) {
+        addr &= ~insitu::noalloc_alias_bit;   // attribute to the aliased address's home tile
         int cls = 3;   // external (outside the cached window)
         if (addr - cached_base_ < cached_size_) {
             const insitu::ReqRoute r = geom_.route_request(addr, my_tile, 0);
@@ -107,11 +108,12 @@ private:
                    /*n_tiles*/nb_tile, /*dyn_offset*/6, /*addr_w*/32, /*priv_start*/0);
         const char *regions = getenv("CACHEPOOL_L1_REGIONS");
         if (regions != nullptr) geom_.parse_regions(regions);
-        if (const char *cc = getenv("CACHEPOOL_PC_STATS_CTRL")) {
-            ctrl_addr_ = (uint32_t)envu("CACHEPOOL_PC_STATS_CTRL", 0);
-            if (ctrl_addr_ != 0) active_ = false;   // windowed: the target opens the window
-            (void)cc;
-        }
+        // Measurement-window control word: the fixed hint-page register (cachepool.py
+        // HINT_BASE+8) by default — no nm step; a store there still travels to the tile xbar,
+        // which swallows any hint-page access. CACHEPOOL_PC_STATS_CTRL overrides (0 = always-on,
+        // un-windowed). With a control word, the target opens the window (store 1) itself.
+        ctrl_addr_ = (uint32_t)envu("CACHEPOOL_PC_STATS_CTRL", 0xC0040008ull);
+        if (ctrl_addr_ != 0) active_ = false;
         if (const char *cf = getenv("CACHEPOOL_PC_STATS_CORE")) {
             for (const char *p = cf; *p; ) {
                 char *end = nullptr;

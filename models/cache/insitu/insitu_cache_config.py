@@ -463,10 +463,11 @@ class InsituCacheTileConfig:
     # AND the remote xbars — a region defines what an address means, so every router must agree.
     # Empty = flat routing everywhere.
     regions: str = ''
-    # No-allocate window "base:size" over GLOBAL addresses (rlc_am doc/RLC_HW.md §2), applied by
-    # every bank: reads inside it never allocate a way (single-line stream buffer instead),
-    # writes go write-through only. Empty = disabled.
-    noalloc: str = ''
+    # Fixed hint-register page base (rlc_am doc/RLC_HW.md §2/§4b): +0 is the posted-prefetch
+    # register each tile xbar intercepts for its local cores. The no-allocate attribute itself
+    # is per access — the address alias bit (route.hpp noalloc_alias_bit), stripped at the tile
+    # xbar and carried as IoReq::noalloc. 0 = no hint page.
+    hint_base: int = 0
     controller: InsituCacheControllerConfig = field(
         default_factory=InsituCacheControllerConfig)
     coalescer: InsituCacheCoalescerConfig = field(
